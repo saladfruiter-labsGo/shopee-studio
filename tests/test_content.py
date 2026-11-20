@@ -144,7 +144,7 @@ class RunnerTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = Store(self.temp.name)
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         self.check = analysis.make_check([])
 
     def configure(self, *providers, retries=0):
@@ -253,7 +253,7 @@ class DeliveryTest(unittest.TestCase):
         sleeper.start()
         self.addCleanup(sleeper.stop)
         self.store = Store(self.temp.name)
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         self.store.save_telegram(dict(token="123456:" + "A" * 30, chat_id="-1001234", thread_id=""))
         self.store.save_settings(dict(flow_project_url="https://flow.google.com/project/test"))
         nodes = [node(i, productName="Pote Hermético 1,5L Tampa Click",
@@ -326,7 +326,7 @@ class WorkerApiTest(unittest.TestCase):
             self.app = create_app(self.temp.name, testing=True)
         self.client = self.app.test_client()
         self.store = self.app.extensions["store"]
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         result = self.client.post("/api/login", json={"password": "test-password-only"})
         self.headers = {"X-CSRF-Token": result.json["csrf"]}
 

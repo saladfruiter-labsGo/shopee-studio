@@ -110,8 +110,8 @@ def video_prompt_v3(script, ficha, seconds=VIDEO_SECONDS):
         f"Velocidade: {SPEED}.",
         f"Cerca de {TRAVEL_SECONDS} s de trajeto em movimento e no máximo ~{MAX_STILL_SECONDS} s parado no final.",
         "Placas, letreiros e fachadas aparecem sem texto escrito (formas e cores, nenhuma letra).",
-        f"Fala em português do Brasil, voz natural e animada: \"{script['narration'].strip()}\" — termina por volta "
-        "de 10–13 s; os últimos ~2 s ficam sem fala, só som ambiente.",
+        f"Fala em português do Brasil, voz natural e animada: \"{script['narration'].strip()}\" — termina até ~11 s "
+        "(a edição fica em 10–12 s); o resto do clipe fica sem fala, só som ambiente.",
         "Sem textos, legendas, banners, logotipos ou marcas d'água na imagem. Sem preços, descontos ou promessas.",
     ])
 
@@ -154,3 +154,16 @@ def fidelity_issues(note, ficha, script):
     if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 10:
         problems.append("score deve ser inteiro de 0 a 10")
     return problems
+
+
+# ---------- orçamento (C2) ----------
+def budget_allows(settings, used_today=0):
+    """Único portão de orçamento do caminho v3, para qualquer origem (automático, do dia ou manual).
+
+    Teto `video_daily_credits` = 0 recusa toda geração real; só o igaoeu muda o teto. Retorna (ok, motivo)."""
+    cap, cost = int(settings["video_daily_credits"]), int(settings["video_clip_cost_expected"])
+    if cap <= 0:
+        return False, "teto diário de 0 créditos (video_daily_credits = 0): geração real recusada até o igaoeu definir o teto"
+    if used_today + cost > cap:
+        return False, f"teto diário de {cap} créditos atingido ({used_today} usados hoje)"
+    return True, ""

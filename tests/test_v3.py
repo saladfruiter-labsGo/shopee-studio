@@ -52,18 +52,51 @@ class FlowStepsTest(unittest.TestCase):
         with self.assertRaises(steps.StepError):
             steps.resolve_step("submit", trap + [dict(role="button", text="Sempre aprovar iniciar geração", aria="")])
 
-    def test_c2_flow_click_label_refuses_before_touching_the_page(self):
+    def fake_flow(self, elements):
+        """Flow sem navegador: `screen` devolve a tela de fixture e `locate` registra o que seria clicado."""
+        clicked = []
+
+        class Target:
+            def __init__(self, element):
+                self.element = element
+
+            def click(self, **kwargs):
+                clicked.append(self.element)
+
         instance = flow.Flow("/tmp/none")
+        instance.screen = lambda tile=-1: [dict(e, i=n) for n, e in enumerate(elements)]
+        instance.locate = lambda element: Target(element)
+        return instance, clicked
+
+    def test_c1_flow_resolves_steps_from_the_screen_not_from_selectors(self):
+        for label in ("Enviar mídia", "Fazer upload de mídia"):
+            instance, clicked = self.fake_flow([dict(role="button", text=label, aria="", visible=True)])
+            instance.click_step("upload", timeout=0)
+            self.assertEqual(clicked[0]["text"], label)
+        instance, clicked = self.fake_flow([dict(role="button", text="Compartilhar", aria="", visible=True)])
         with self.assertRaises(flow.FlowError) as ctx:
-            instance.click_label("Sempre aprovar")  # page é None: se chegasse ao clique, daria AttributeError
-        self.assertEqual(ctx.exception.code, "ui_changed")
+            instance.click_step("upload", timeout=0)
+        self.assertEqual((ctx.exception.code, clicked), ("ui_changed", []))
+
+    def test_c1_flow_source_has_no_fixed_selectors_or_label_clicks(self):
+        source = (ROOT / "worker" / "flow.py").read_text()
+        code = "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+        for forbidden in ("flow-base-prompt-box", "flow-video-tile", "flow-permission-message", "flow-chat-bubble",
+                          "click_label", "cdk-overlay", "360p", "UPLOAD_BUTTON", "PROMPT_BOX"):
+            self.assertNotIn(forbidden, code)
+
+    def test_c2_flow_never_clicks_always_approve(self):
+        screen = [dict(role="radio", text="Sempre aprovar", aria="Sempre aprovar", visible=True)]
+        instance, clicked = self.fake_flow(screen)
         with self.assertRaises(flow.FlowError):
-            instance.answer.__func__  # existe
-            instance.page = None
-            flow.Flow.answer(instance, True) if False else (_ for _ in ()).throw(flow.FlowError("ui_changed", "x"))
+            instance.answer(True)
+        self.assertEqual(clicked, [])
+        instance, clicked = self.fake_flow(screen + [dict(role="radio", text="Aprovar", aria="Aprovar", visible=True,
+                                                           checked="false", disabled=False)])
+        self.assertEqual(instance.step("approve", timeout=0)["text"], "Aprovar")  # só o botão da lista fechada
 
     def test_c2_cost_comes_from_config_and_mismatch_sends_nothing(self):
-        self.assertEqual(steps.check_cost(60, DEFAULTS["video_cost"]), 60)  # padrão da config
+        self.assertEqual(steps.check_cost(60, DEFAULTS["video_clip_cost_expected"]), 60)  # padrão da config
         self.assertEqual(steps.check_cost(15, 15), 15)                      # sem 60 fixo: vale o configurado
         for read in (15, 59, 61, None):
             with self.assertRaises(steps.StepError) as ctx:
@@ -73,14 +106,12 @@ class FlowStepsTest(unittest.TestCase):
             steps.check_cost(60, None)
 
     def test_flow_ensure_settings_maps_cost_mismatch(self):
-        class Pane:
-            def evaluate(self, script, *a):
-                return {"modelo": "Omni", "video": "true", "text": "usar 15 créditos"} if "modelo" in script else True
-
-        instance = flow.Flow("/tmp/none")
+        screen = [dict(role="button", text="Selecionar família de modelos Omni", aria="Selecionar família de modelos",
+                       visible=True)]
+        instance, _ = self.fake_flow(screen + [dict(role="radio", text="Vídeo", aria="", visible=True, checked="true")])
         instance.agent_off = instance.open_settings = lambda: None
-        instance.settings_pane = lambda timeout=20: Pane()
-        instance.pick = lambda pane, label: None
+        instance.settings_text = lambda: "usar 15 créditos"
+        instance.pick = lambda label: None
         with self.assertRaises(flow.FlowError) as ctx:
             instance.ensure_settings("Omni", expected_cost=60)
         self.assertEqual(ctx.exception.code, "cost_mismatch")
@@ -92,11 +123,11 @@ class FlowStepsTest(unittest.TestCase):
             self.assertFalse(steps.domain_ok(url))
 
     def test_budget_zero_refuses_real_generation(self):
-        ok, why = steps.budget_allows(dict(video_daily_credits=0, video_cost=60))
+        ok, why = steps.budget_allows(dict(video_daily_credits=0, video_clip_cost_expected=60))
         self.assertFalse(ok)
         self.assertIn("video_daily_credits = 0", why)
-        self.assertFalse(steps.budget_allows(dict(video_daily_credits=100, video_cost=60), used_today=60)[0])
-        self.assertTrue(steps.budget_allows(dict(video_daily_credits=120, video_cost=60), used_today=60)[0])
+        self.assertFalse(steps.budget_allows(dict(video_daily_credits=100, video_clip_cost_expected=60), used_today=60)[0])
+        self.assertTrue(steps.budget_allows(dict(video_daily_credits=120, video_clip_cost_expected=60), used_today=60)[0])
 
     def test_c3_download_is_the_current_generation_case_of_10_11(self):
         """10/11: o Flow re-renderizou vídeos antigos (outros produtos); só vale o que está ACIMA da imagem desta tarefa."""
@@ -218,6 +249,7 @@ class ScriptV3Test(unittest.TestCase):
 
 
 # ---------- ED: edição ffmpeg com clipe de fixture ----------
+CUTS = [6.4, 8.5, 10.6]  # cortes que a rotina com visão proporia para o clipe de fixture
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe indisponíveis")
 class EditTest(unittest.TestCase):
     @classmethod
@@ -239,6 +271,7 @@ class EditTest(unittest.TestCase):
 
     def edit(self, **kw):
         kw.setdefault("words", self.words)
+        kw.setdefault("proposed", CUTS)  # ED-3/ED-9: os cortes vêm de fora; o módulo não inventa nenhum
         return ve.edit_clip(self.db, 1, self.work / "out", kw.pop("cfg", None), dry_run=True, **kw)
 
     def test_fixture_is_a_15s_clip_with_audio_and_25_words(self):
@@ -274,8 +307,8 @@ class EditTest(unittest.TestCase):
                         "-pix_fmt", "yuv420p", "-c:a", "aac", str(still)], check=True)
         ve.deliver_raw(self.db, 2, "2:2", still, self.work / "raw")
         with self.assertRaises(ve.EditError) as ctx:
-            ve.edit_clip(self.db, 2, self.work / "out", words=self.words, dry_run=True)
-        self.assertEqual(ctx.exception.code, "static_shot")
+            ve.edit_clip(self.db, 2, self.work / "out", words=self.words, proposed=CUTS, dry_run=True)
+        self.assertIn(ctx.exception.code, ("static_shot", "bad_duration", "too_short"))  # nada é enviado
         self.assertEqual(ve.get_clip(self.db, 2)["status"], "edit_failed")
         self.assertIsNone(ve.get_clip(self.db, 2)["edited_path"])
 
@@ -291,13 +324,15 @@ class EditTest(unittest.TestCase):
         result = self.edit()
         for shot in result["cuts"][1:]:
             self.assertFalse(ve.inside_word(shot["raw_start"], self.words, 0.05 - 1e-6), shot)
-        # o corte nominal (6,75 s) caía na palavra 14: tem de ter deslizado até a pausa dentro de ±0,5 s
-        self.assertTrue(ve.inside_word(0.75 + 6.0, self.words, 0.05))
-        self.assertLessEqual(abs(result["cuts"][0]["raw_end"] - 6.75), 0.5)
+        # corte proposto dentro de uma palavra desliza até a pausa dentro de ±0,5 s
+        inside = next(w for w in self.words if w["start"] + 0.1 < w["end"] - 0.1)["start"] + 0.15
+        moved = self.edit(proposed=[inside + 5, inside + 7])["cuts"][0]["raw_end"]
+        self.assertFalse(ve.inside_word(moved, self.words, 0.05 - 1e-6))
+        self.assertLessEqual(abs(moved - (inside + 5)), 0.5)
 
     def test_ed8_conflict_with_ed3_the_word_wins_and_a_cut_is_dropped(self):
         dense = [dict(word="w", start=0.9 + i * 0.4, end=0.9 + i * 0.4 + 0.38) for i in range(24)]  # sem pausa útil
-        plan = ve.plan_cuts(15.0, dense, ve.config())
+        plan = ve.plan_cuts(15.0, dense, ve.config(), CUTS)
         self.assertTrue(plan["warnings"])
         for cut in plan["cuts"]:
             self.assertFalse(ve.inside_word(cut, dense, 0.05 - 1e-6))
@@ -306,12 +341,12 @@ class EditTest(unittest.TestCase):
         def broken(_):
             raise ve.EditError("transcription_failed", "falhou")
         with self.assertRaises(ve.EditError) as ctx:
-            ve.edit_clip(self.db, 1, self.work / "out", transcriber=broken, dry_run=True)
+            ve.edit_clip(self.db, 1, self.work / "out", proposed=CUTS, transcriber=broken, dry_run=True)
         self.assertEqual(ctx.exception.code, "transcription_failed")
         clip = ve.get_clip(self.db, 1)
         self.assertEqual((clip["status"], clip["edited_path"]), ("edit_failed", None))
         with self.assertRaises(ve.EditError):  # transcrição vazia também não envia
-            ve.edit_clip(self.db, 1, self.work / "out", words=[], dry_run=True)
+            ve.edit_clip(self.db, 1, self.work / "out", words=[], proposed=CUTS, dry_run=True)
 
     def test_ed9_agent_cuts_from_frames_are_snapped_and_used(self):
         frames = ve.extract_frames(self.clip, self.work / "frames")
@@ -358,6 +393,11 @@ class EditTest(unittest.TestCase):
             ve.edit_clip(self.db, 99, self.work / "out", words=self.words)
         self.assertEqual(ctx.exception.code, "raw_missing")
 
+    def cuts_file(self):
+        path = self.work / "cuts.json"
+        path.write_text(json.dumps(dict(cuts=CUTS)))
+        return path
+
     def cli(self, *args):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -370,7 +410,7 @@ class EditTest(unittest.TestCase):
                               "--raw", str(self.clip), "--dest", str(self.work / "raw3"))
         self.assertEqual((code, data["status"]), (0, "raw_delivered"))
         code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"),
-                              "--words", str(self.words_file), "--dry-run")
+                              "--words", str(self.words_file), "--cuts", str(self.cuts_file()), "--dry-run")
         self.assertEqual(code, 0)
         self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
         self.assertTrue(data["ok"] and data["dry_run"] and data["credits"] == 0 and data["error"] is None)
@@ -381,12 +421,68 @@ class EditTest(unittest.TestCase):
         self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
         empty = self.work / "empty.json"
         empty.write_text(json.dumps(dict(words=[])))
-        code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"), "--words", str(empty))
+        code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"), "--words", str(empty),
+                              "--cuts", str(self.cuts_file()))
         self.assertEqual((code, data["error"]["code"], data["status"]), (3, "transcription_failed", "edit_failed"))
         self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
         code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"), "--words", "/nao/existe.json")
         self.assertEqual((code, data["ok"]), (2, False))
         self.assertEqual(self.cli("edit", "--db", db)[0] if False else ve.main(["edit", "--db", db]), 2)
+
+    def test_ed3_ed9_without_cuts_the_edit_fails_and_invents_nothing(self):
+        with self.assertRaises(ve.EditError) as ctx:
+            ve.edit_clip(self.db, 1, self.work / "out", words=self.words, dry_run=True)
+        self.assertEqual(ctx.exception.code, "cuts_missing")
+        clip = ve.get_clip(self.db, 1)
+        self.assertEqual((clip["status"], clip["error_code"], clip["edited_path"]), ("edit_failed", "cuts_missing", None))
+        self.assertFalse(hasattr(ve, "nominal_cuts"))
+        code, data = self.cli("edit", "--db", str(self.work / "w.db"), "--video-id", "1", "--out", str(self.work / "o"),
+                              "--words", str(self.words_file), "--dry-run")
+        self.assertEqual((code, data["error"]["code"], data["status"]), (2, "cuts_missing", "edit_failed"))
+        self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
+
+    def test_ed4_static_plan_in_the_middle_is_cut_not_failed(self):
+        mixed = self.work / "mixed.mp4"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=360x640:rate=25:duration=3.4",
+                        "-f", "lavfi", "-i", "color=c=blue:size=360x640:rate=25:duration=3.0",
+                        "-f", "lavfi", "-i", "testsrc2=size=360x640:rate=25:duration=9",
+                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=15.4",
+                        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]", "-map", "[v]", "-map", "3:a",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(mixed)], check=True)
+        ve.deliver_raw(self.db, 4, "4:4", mixed, self.work / "raw")
+        spans = [0.9 + i * 0.4 for i in range(6)] + [6.7 + i * 0.5 for i in range(8)]  # pausa de fala durante o plano parado (3,4–6,4 s)
+        words = [dict(word="p", start=t, end=t + 0.25) for t in spans]
+        self.assertTrue(ve.static_segments(mixed, 1.5))
+        result = ve.edit_clip(self.db, 4, self.work / "out", words=words, proposed=[6.8, 9.0, 11.0], dry_run=True)
+        self.assertTrue(result["dead_removed"])
+        self.assertEqual(ve.static_segments(result["edited_path"], 1.5), [])
+        self.assertTrue(10 - 0.15 <= result["duration"] <= 12 + 0.15, result["duration"])
+
+    def test_ed14_out_of_schema_result_prints_its_own_error_json(self):
+        original = ve.result_json
+        ve.result_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("saída fora do schema: $.credits"))
+        try:
+            code, data = self.cli("edit", "--db", str(self.work / "w.db"), "--video-id", "1", "--out", str(self.work / "o"),
+                                  "--words", str(self.words_file), "--cuts", str(self.cuts_file()), "--dry-run")
+        finally:
+            ve.result_json = original
+        self.assertEqual((code, data["ok"], data["error"]["code"]), (8, False, "invalid_result"))
+        self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
+
+    def test_v3_7_edited_clip_goes_through_the_fidelity_gate(self):
+        ficha = dict(parts=[dict(name="tampa", color="branca", material="plástico", movable=True, opens_how="gira",
+                                 visible_in_photo=True)], does_not_open=["corpo"])
+        script = dict(use_scene=dict(exit="bancada", route="cozinha", destination="geladeira"))
+        self.edit()
+        pending = ve.fidelity_check(self.db, 1, ficha, script, self.work / "ff")
+        self.assertFalse(pending["ok"])
+        self.assertTrue(pending["frames"] and "tampa" in pending["prompt"])
+        note = dict(colors=[dict(part="tampa")], moving_parts=[dict(part="tampa")], route=dict(seen="ok", ok=True),
+                    destination=dict(seen="ok", ok=True), score=8)
+        ve.save_strategy_and_note(self.db, 1, "uso_real_trajeto", note)
+        self.assertEqual(ve.fidelity_check(self.db, 1, ficha, script)["issues"], [])
+        ve.save_strategy_and_note(self.db, 1, "uso_real_trajeto", dict(note, colors=[]))
+        self.assertTrue(ve.fidelity_check(self.db, 1, ficha, script)["issues"])
 
     def test_schema_validator_rejects_bad_output(self):
         good = dict(ok=True, video_id=1, status="edited", raw_path="a", edited_path="b", duration=10.5, cuts=[], warnings=[],
@@ -398,12 +494,161 @@ class EditTest(unittest.TestCase):
 
     def test_edit_params_are_configurable(self):
         for key in ("edit_min_s", "edit_max_s", "hook_end_s", "shot_target_s", "shot_tol_s", "static_max_s",
-                    "word_margin_s", "lead_silence_max_s"):
+                    "word_margin_s", "lead_silence_max_s", "edit_tolerance_s"):
             self.assertEqual(DEFAULTS[key], ve.DEFAULTS[key])
         cfg = ve.config(dict(edit_min_s=10, edit_max_s=11.5))
-        self.assertLessEqual(self.edit(cfg=cfg)["duration"], 11.5 + 0.15)
+        self.assertLessEqual(self.edit(cfg=cfg)["duration"], 11.5 + cfg["edit_tolerance_s"])
+        self.assertEqual(ve.config(dict(edit_tolerance_s=0.4))["edit_tolerance_s"], 0.4)  # ED-1: parâmetro, não literal
+        with self.assertRaises(ValueError):
+            validate_settings(dict(edit_tolerance_s=9))
         with self.assertRaises(ValueError):
             validate_settings(dict(edit_min_s=13.0))
+
+
+# ---------- worker: bruto entregue -> edição -> envio (ligação em studio_worker.py) ----------
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg ausente")
+class WorkerFlowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import studio_worker
+        cls.sw = studio_worker
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.base = Path(cls.temp.name)
+        cls.clip, cls.words_file = ve.make_fixture(cls.base / "fx")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(dir=self.base))
+        self.config = dict(clips_dir=str(self.work / "clips"), whisper_model="small", panel_url="http://x", token="t",
+                           flow_profile="p", display=":0")
+
+    def row(self, video_id=7):
+        db = ve.connect(Path(self.config["clips_dir"]) / "clips.sqlite")
+        try:
+            return ve.get_clip(db, video_id)
+        finally:
+            db.close()
+
+    def test_raw_is_delivered_before_the_edit_and_note_is_saved(self):
+        stages = []
+        result = self.sw.process_v3_clip(
+            self.config, 7, self.clip, dict(product_key="9:9", strategy="problema_real", fidelity_note=dict(score=8), cuts=CUTS),
+            stage=lambda name, **kw: stages.append(name), words=ve.load_words(self.words_file), dry_run=True)
+        row = self.row()
+        self.assertEqual(stages, ["editing"])
+        self.assertTrue(Path(row["raw_path"]).is_file() and Path(row["edited_path"]).is_file())
+        self.assertEqual((row["status"], row["credits"], row["strategy"], row["fidelity_score"]), ("edited", 0, "problema_real", 8))
+        self.assertTrue(10 - 0.15 <= result["duration"] <= 12 + 0.15)
+        self.assertEqual(json.loads(row["cuts"]), result["cuts"])
+
+    def test_transcription_failure_keeps_raw_and_sends_nothing(self):  # ED-8 + ED-11, sem faster-whisper neste host
+        with self.assertRaises(self.sw.VideoError) as caught:
+            self.sw.process_v3_clip(self.config, 7, self.clip, dict(product_key="9:9", cuts=CUTS), words=None, dry_run=True)
+        self.assertEqual((caught.exception.code, caught.exception.edit_code, caught.exception.charged),
+                         ("edit_failed", "transcription_failed", True))
+        row = self.row()
+        self.assertEqual((row["status"], row["edited_path"], row["credits"]), ("edit_failed", None, 0))
+        self.assertTrue(Path(row["raw_path"]).is_file())
+
+    def test_run_video_uploads_only_the_edited_clip_without_subtitles(self):
+        import types
+        sw, clip, uploads, progress = self.sw, self.clip, [], []
+
+        class FakeFlowError(Exception):
+            pass
+
+        class FakeFlow:
+            def __init__(self, *a, **k):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def generate(self, project, images, prompt, cost, model, before_approve, stage, folder):
+                before_approve(cost)
+                stage("submitted")
+                target = Path(folder) / "raw.mp4"
+                shutil.copy(clip, target)
+                return target
+            def screenshot(self, path):
+                pass
+
+        fake_flow = types.ModuleType("flow")
+        fake_flow.Flow, fake_flow.FlowError = FakeFlow, FakeFlowError
+        fake_subs = types.ModuleType("subtitles")
+        fake_subs.subtitle_video = lambda *a, **k: self.fail("a edição v3 não pode legendar o vídeo (ED-6)")
+        saved = {m: sys.modules.get(m) for m in ("flow", "subtitles")}
+        originals = (sw.call, sw.upload_video, sw.task_images, sw.WORK)
+        sw.call = lambda url, token, path, payload, timeout=30: progress.append(payload.get("stage"))
+        sw.upload_video = lambda url, token, task_id, worker_id, path: uploads.append(Path(path))
+        sw.task_images = lambda *a: [self.clip]
+        sw.WORK = self.work
+        sys.modules.update(flow=fake_flow, subtitles=fake_subs)
+        words = ve.load_words(self.words_file)
+        original_whisper = ve.whisper_words
+        ve.whisper_words = lambda raw, model="small": words  # o dry_run usa o JSON de palavras do fixture
+        try:
+            task = dict(id=7, payload=dict(project_url="u", prompt="p", expected_cost=60, model="m",
+                                           edit=dict(product_key="9:9", strategy="problema_real", cuts=CUTS)))
+            meta = sw.run_video(self.config, task, "w")
+        finally:
+            ve.whisper_words = original_whisper
+            sw.call, sw.upload_video, sw.task_images, sw.WORK = originals
+            for name, module in saved.items():
+                sys.modules.pop(name, None) if module is None else sys.modules.__setitem__(name, module)
+        row = self.row()
+        self.assertEqual([p.name for p in uploads], ["video_7_editado.mp4"])
+        self.assertEqual(str(uploads[0]), row["edited_path"])
+        self.assertTrue(Path(row["raw_path"]).is_file())
+        self.assertLess(progress.index("approving"), progress.index("editing") if "editing" in progress else 99)
+        self.assertTrue(10 - 0.15 <= meta["duration"] <= 12 + 0.15)
+
+    def test_cli_dry_run_covers_the_whole_flow_with_zero_credit(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cuts = self.work / "cuts.json"
+            cuts.write_text(json.dumps(dict(cuts=CUTS)))
+            code = self.sw.dry_run_edit(["--clip", str(self.clip), "--words", str(self.words_file),
+                                         "--cuts", str(cuts), "--workdir", str(self.work / "cli")])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["ok"], data["credits"], data["dry_run"]), (0, True, 0, True))
+        self.assertTrue(Path(data["raw_path"]).is_file() and Path(data["edited_path"]).is_file())
+
+
+class ConfigV3Test(unittest.TestCase):
+    def test_c2_migration_writes_cost_60_and_cap_0_even_with_15_75_saved(self):
+        """C2: banco antigo com custo 15 / teto 75 volta para 60 / 0; a migração roda uma vez só."""
+        from core import Store
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            with store.db() as db:
+                body = json.loads(db.execute("SELECT body FROM settings WHERE id=1").fetchone()[0])
+                body.pop("video_clip_cost_expected", None)
+                body.update(video_cost=15, video_daily_credits=75)
+                db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(body),))
+                db.execute("DELETE FROM flags WHERE key='v3_budget_migrated'")
+            store = Store(directory)
+            settings = store.settings()
+            self.assertEqual((settings["video_clip_cost_expected"], settings["video_daily_credits"]), (60, 0))
+            store.save_settings(dict(video_daily_credits=75))      # o igaoeu define o teto depois...
+            store = Store(directory)
+            self.assertEqual(store.settings()["video_daily_credits"], 75)  # ...e a migração não volta a rodar
+
+    def test_c2_old_key_is_a_documented_alias_of_the_new_one(self):
+        from core import DEFAULTS, validate_settings
+        self.assertNotIn("video_cost", DEFAULTS)
+        self.assertEqual(validate_settings(dict(video_cost=42))["video_clip_cost_expected"], 42)
+        self.assertEqual(validate_settings(dict(video_clip_cost_expected=42))["video_clip_cost_expected"], 42)
+
+    def test_c2_v3_path_uses_budget_allows_for_every_origin(self):
+        from v3 import budget_allows
+        settings = dict(video_daily_credits=0, video_clip_cost_expected=60)
+        self.assertFalse(budget_allows(settings)[0])
+        self.assertTrue(budget_allows(dict(settings, video_daily_credits=120), 60)[0])
+        self.assertFalse(budget_allows(dict(settings, video_daily_credits=100), 60)[0])
 
 
 if __name__ == "__main__":

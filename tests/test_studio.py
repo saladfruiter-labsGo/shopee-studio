@@ -9,6 +9,10 @@ from core import DEFAULTS, Engine, Store, TZ, fetch_offers, fetch_product_page, 
 from app import create_app
 
 
+NARRATION = ("Pote que vaza estraga a comida, né? Esse fecha com um clique, segura tudo fresco e cabe na geladeira "
+             "sem ocupar espaço nenhum. Toque no produto marcado.")
+
+
 def good_output(count=0, verdicts=None):
     verdicts = verdicts or {}
     return dict(equivalents=[dict(id=f"C{i}", verdict=verdicts.get(i, "incompatible"), reason="motivo")
@@ -17,7 +21,13 @@ def good_output(count=0, verdicts=None):
                 hashtags=["#PoteHermetico", "#CozinhaOrganizada"],
                 hook="Close do pote sendo fechado com um clique", demo="Mão enche o pote e fecha a tampa",
                 benefit="Alimentos frescos por mais tempo", cta="Pessoa aponta para o produto do vídeo",
-                narration="Olha que prático: fecha com um clique e mantém tudo fresco. Toque no produto do vídeo.")
+                narration=NARRATION,
+                ficha=dict(parts=[dict(name="tampa", color="branca", material="plástico", movable=True,
+                                       opens_how="gira para a esquerda", visible_in_photo=True),
+                                  dict(name="corpo", color="transparente", material="plástico", movable=False,
+                                       visible_in_photo=True)], does_not_open=["corpo"]),
+                use_scene=dict(exit="da bancada", route="pela cozinha até a geladeira", destination="na prateleira da geladeira",
+                               actions=[dict(part="tampa", action="gira para fechar")]))
 
 
 class FakeRunner:
@@ -105,7 +115,7 @@ class EngineTest(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store=Store(self.temp.name)
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         # top_count explícito: o padrão (3, D9) muda com o produto; estes testes foram escritos para 5.
         self.store.save_settings(dict(schedule_enabled=True,auto_send=False,top_count=5))
         sleeper=patch("core.time.sleep")
@@ -237,7 +247,7 @@ class ApiTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         with patch.dict(os.environ,{"PANEL_PASSWORD":"test-password-only"}):
             self.app=create_app(self.temp.name,testing=True)
-        self.app.extensions["store"].save_settings(dict(video_daily_credits=75, video_cost=15))
+        self.app.extensions["store"].save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))
         self.client=self.app.test_client()
         self.app.extensions["engine"].fetcher=lambda _: [node()]
         self.app.extensions["engine"].searcher=lambda *args: []

@@ -232,7 +232,7 @@ class EngineModernTest(unittest.TestCase):
         sleeper.start()
         self.addCleanup(sleeper.stop)
         self.store = Store(self.temp.name)
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         # top_count explícito: o padrão (3, D9) muda com o produto; estes testes foram escritos para 5.
         self.store.save_settings(dict(mode="modern", flow_project_url=PROJECT, top_count=5))
         self.top_calls = 0
@@ -262,7 +262,8 @@ class EngineModernTest(unittest.TestCase):
         for index in range(1, len(formats)):  # never one of the previous three
             self.assertNotIn(formats[index], formats[max(0, index - 3):index])
         self.assertIn("REGRAS DO MODO MODERNO", self.runner.calls[0]["prompt"])
-        self.assertIn("Somente mãos aparecem", selected[0]["analysis"]["prompt"])
+        self.assertIn("Vários planos dentro do mesmo clipe", selected[0]["analysis"]["prompt"])  # v3 substitui o só-mãos
+        self.assertTrue(selected[0]["analysis"]["v3"])
         day = datetime.now(TZ).strftime("%Y-%m-%d")
         self.assertEqual(self.store.sales_history(["1"])["1"], [(day, 310)])
         self.engine.collect()
@@ -399,7 +400,7 @@ class VideoModernTest(unittest.TestCase):
             self.app = create_app(self.temp.name, testing=True)
         self.client = self.app.test_client()
         self.store, self.engine = self.app.extensions["store"], self.app.extensions["engine"]
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         self.engine.modern_fetcher = lambda s: dict(nodes=[mnode(i) for i in range(1, 4)], warnings=[])
         self.engine.top_fetcher = lambda s: set()
         self.engine.searcher = lambda *a, **k: dict(nodes=[], pageInfo={})
@@ -435,6 +436,10 @@ class VideoModernTest(unittest.TestCase):
         self.assertEqual(finish["size"], [1080, 1920])
         self.assertEqual(finish["badge"], dict(rating="4,8", sold="300 vendidos"))
         self.assertTrue(finish["frames"])
+        edit = task["payload"]["edit"]  # padrão v3: ficha e cena de uso seguem com a tarefa; sem cortes inventados
+        self.assertTrue(edit["ficha"]["parts"] and edit["use_scene"]["destination"])
+        self.assertNotIn("cuts", edit)
+        self.assertEqual(edit["config"]["edit_tolerance_s"], 0.15)
 
     def test_frames_validation(self):
         task = self.claim()
