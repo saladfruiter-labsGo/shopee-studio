@@ -553,7 +553,7 @@ class Studio:
             manual = [self._lite(dict(r)) for r in db.execute(
                 "SELECT * FROM studio WHERE origin='manual' ORDER BY id DESC LIMIT 20")]
         return dict(slots=settings["studio_slots"], cutoff=settings["studio_cutoff"], today=self.today(), manual=manual,
-                    cost=settings["video_cost"], manual_credits=self.engine.videos.manual_credits(),
+                    cost=settings["video_clip_cost_expected"], manual_credits=self.engine.videos.manual_credits(),
                     styles=[dict(key=k, label=v["label"], text=v["text"]) for k, v in SCRIPT_STYLES.items()],
                     callout_roles=list(CALLOUT_ROLES),
                     formats=[dict(key=k, label=f["label"], text=f["text"], person=f["person"], speaks=f["speaks"])
@@ -911,8 +911,8 @@ class Studio:
     def generate(self, session_id, cost):
         """The user approved the cost on the screen (E3): one generation of 1 scene with the chosen script."""
         settings = self.store.settings()
-        if isinstance(cost, bool) or cost != settings["video_cost"]:
-            raise ValueError(f"O custo por vídeo agora é {settings['video_cost']} créditos; confira e aprove de novo.")
+        if isinstance(cost, bool) or cost != settings["video_clip_cost_expected"]:
+            raise ValueError(f"O custo por vídeo agora é {settings['video_clip_cost_expected']} créditos; confira e aprove de novo.")
         row = self._row(session_id)
         draft = self.get(session_id)
         if draft["chosen"] is None or not draft["prompt"]:
@@ -1034,7 +1034,7 @@ class Studio:
         for video in videos:
             video["url"] = f"/api/studio/{row['id']}/videos/{video['id']}" if video["has_file"] else None
         photo_urls = {p["id"]: p["url"] for p in public_photos}
-        generation = dict(cost=settings["video_cost"], used=self.engine.videos.used_today(),
+        generation = dict(cost=settings["video_clip_cost_expected"], used=self.engine.videos.used_today(),
                           cap=settings["video_daily_credits"], manual=self.engine.videos.manual_credits(),
                           refs=[photo_urls.get(r["id"]) for r in refs], max_refs=MAX_FLOW_REFS,
                           enabled=settings["video_enabled"], paused=self.engine.videos.flag("video_pause"),

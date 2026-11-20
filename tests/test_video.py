@@ -35,7 +35,7 @@ class VideoTest(unittest.TestCase):
             self.app = create_app(self.temp.name, testing=True)
         self.client = self.app.test_client()
         self.store, self.engine = self.app.extensions["store"], self.app.extensions["engine"]
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         self.engine.fetcher = lambda _: [node(i, imageUrl=f"https://down-br.img.susercontent.com/file/{i}") for i in range(1, 4)]
         self.engine.searcher = lambda *a: []
         self.engine.runner = FakeRunner()
@@ -153,8 +153,8 @@ class VideoTest(unittest.TestCase):
     def test_default_budget_is_zero_and_refuses_every_real_generation(self):
         """Padrão v3: video_daily_credits = 0 (config) recusa toda geração real; nenhum crédito é reservado."""
         from core import DEFAULTS
-        self.assertEqual((DEFAULTS["video_daily_credits"], DEFAULTS["video_cost"]), (0, 60))
-        self.store.save_settings(dict(video_daily_credits=0, video_cost=60))
+        self.assertEqual((DEFAULTS["video_daily_credits"], DEFAULTS["video_clip_cost_expected"]), (0, 60))
+        self.store.save_settings(dict(video_daily_credits=0, video_clip_cost_expected=60))
         self.deliver()
         self.assertEqual([(v["state"], v["credits"]) for v in self.videos()], [("skipped", 0)] * 3)
         self.assertTrue(all("teto diário de 0 créditos" in v["error"] for v in self.videos()))

@@ -70,7 +70,7 @@ Preferências → **Modo** escolhe como os produtos e os vídeos são escolhidos
 
 ### Roteiro do Modo Moderno
 
-Além das regras de legenda e roteiro de sempre, o código recusa (e devolve ao modelo para correção): narração fora de 18–25 palavras, última frase sem "produto marcado", abertura com "Olha"/"Gente" ou igual à de um dos últimos 8 vídeos, **número falado que não está no nome do anúncio** (dígitos e números por extenso) e rosto/sorriso nas cenas (só mãos). Cada vídeo recebe um de 7 formatos (`uso_real`, `problema_solucao`, `antes_depois`, `unboxing`, `pov_rotina`, `teste_desafio`, `detalhes_macro`), nunca um dos 3 últimos usados; o prompt do Flow leva o formato e a regra de só mãos.
+Além das regras de legenda e roteiro de sempre, o código recusa (e devolve ao modelo para correção): narração fora da faixa da configuração (padrão 22–28 palavras: `script_words_target` 25 ± `script_words_tol` 3; a fala termina por volta de 11 s do clipe de 15 s), última frase sem "produto marcado", abertura com "Olha"/"Gente" ou igual à de um dos últimos 8 vídeos, **número falado que não está no nome do anúncio** (dígitos e números por extenso) e rosto/sorriso nas cenas (só mãos). Cada vídeo recebe um de 7 formatos (`uso_real`, `problema_solucao`, `antes_depois`, `unboxing`, `pov_rotina`, `teste_desafio`, `detalhes_macro`), nunca um dos 3 últimos usados; o prompt do Flow (padrão v3, um clipe de 15 s com vários planos) leva a ficha por parte e a cena de uso com saída, trajeto e destino.
 
 ### Vídeo do Modo Moderno
 
@@ -88,7 +88,7 @@ O Antigravity CLI e o navegador logado no Google Flow só existem na VM hermes, 
 
 ## Vídeo no Google Flow
 
-Ao enviar uma consulta (manual ou automático), o painel põe um vídeo por produto na fila e reserva o custo esperado (padrão 15 créditos), dentro do teto diário (padrão 75 créditos, horário de Brasília). A descrição e os links de cada produto ficam congelados nesse momento. O worker da VM:
+Ao enviar uma consulta (manual ou automático), o painel põe um vídeo por produto na fila e reserva o custo esperado (`video_clip_cost_expected`, padrão 60 créditos; a chave antiga `video_cost` segue aceita como apelido), dentro do teto diário (`video_daily_credits`, padrão **0** = nenhuma geração real até o igaoeu definir o teto, vale para qualquer origem, inclusive manual; horário de Brasília). Bancos antigos (15/75) são migrados uma única vez para 60/0. A descrição e os links de cada produto ficam congelados nesse momento. O worker da VM:
 
 1. Abre o projeto do Flow configurado e confere as configurações do agente: confirmar antes de gerar, 9:16, 1 versão e o modelo esperado (padrão Omni 1.1 Flash).
 2. Inicia uma sessão nova, anexa a foto do anúncio e envia o prompt de 10 segundos.
@@ -130,7 +130,7 @@ Em cada rascunho:
    pessoa no gancho para ela se manter igual. O modo automático continua com os 7 formatos dele.
 4. **Roteiros:** 3 abordagens diferentes no formato escolhido (o modelo escolhe entre problema e solução, antes e
    depois, teste, uso na rotina, detalhes, unboxing e curiosidade), cada um com gancho (0–2 s), demonstração, prova e chamada, e a legenda. Valem as
-   regras do Modo Moderno (18–25 palavras, termina em "produto marcado", sem "Olha"/"Gente" nem abertura repetida,
+   regras do Modo Moderno (faixa da configuração, padrão 22–28 palavras, termina em "produto marcado", sem "Olha"/"Gente" nem abertura repetida,
    nenhum número fora do nome) e as 3 narrações começam diferente. Edição livre: o card mostra o que fugiu das regras
    sem bloquear. Ao escolher um, aparece o prompt do Flow.
    **Estilo do roteiro** (escolhido antes de gerar; padrão na tela: o novo):
@@ -144,7 +144,7 @@ Em cada rascunho:
      IA. **A fala não ganha legenda** (nem é transcrita). Regras das chamadas: sem emojis, sem preço/desconto/frete/
      estoque/cupom/"corra"/"só hoje"/"últimas unidades", nenhum número fora do nome, as 3 diferentes e a 3ª sem
      "produto marcado" (o botão do fim já diz). A urgência vem do problema, nunca de escassez inventada.
-     **Fim com respiro:** a fala fica em **14–19 palavras** (clássico e automático continuam em 18–25) porque em ~2,3
+     **Fim com respiro:** a fala fica em **14–19 palavras** (o automático segue a faixa da configuração, padrão 22–28) porque em ~2,3
      palavras/s 23 palavras enchiam os 10 s e o vídeo parecia cortado. As cenas de 8–10 s são um plano mais aberto,
      câmera parada e o **produto inteiro** no quadro, com ~2 s sem fala; o prompt do Flow pede esse encerramento
      calmo e a tela mostra a faixa de palavras do estilo escolhido.

@@ -120,7 +120,7 @@ class StudioTest(unittest.TestCase):
             self.app = create_app(self.temp.name, testing=True)
         self.client = self.app.test_client()
         self.store, self.engine = self.app.extensions["store"], self.app.extensions["engine"]
-        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
+        self.store.save_settings(dict(video_daily_credits=75, video_clip_cost_expected=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         # Product 3 scores best, then 2, then 1 (more sales).
         self.engine.fetcher = lambda _: [node(i, sales=100 * i, imageUrl=f"https://down-br.img.susercontent.com/file/{i}")
                                          for i in range(1, 4)]
