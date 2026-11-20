@@ -528,7 +528,13 @@ class Videos:
             rows = [dict(r) for r in db.execute(f"""SELECT v.* FROM videos v JOIN tasks t ON t.id=v.task_id
                 WHERE t.status='expired' AND v.state IN ({','.join('?' * len(ACTIVE))})""", tuple(ACTIVE))]
         for video in rows:
-            if video["state"] == "editing":  # etapa 2 não concluída: o bruto segue no worker, nada foi enviado
+            try:
+                stage2 = bool(self.store.task(video["task_id"])["payload"].get("edit_stage"))
+            except (ValueError, KeyError, TypeError):
+                stage2 = False
+            # etapa 2 não concluída (em qualquer estado ativo): os créditos já foram gastos na etapa 1, o bruto
+            # segue no worker e nada foi enviado; mantém créditos e não libera nova geração.
+            if video["state"] == "editing" or stage2:
                 self.update(video["id"], state="edit_failed", error="O worker não concluiu a edição no prazo.")
                 self.sync(video["id"])
                 continue

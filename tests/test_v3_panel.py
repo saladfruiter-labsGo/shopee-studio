@@ -141,6 +141,27 @@ class PanelV3Test(unittest.TestCase):
             self.store.save_settings(dict(edit_cuts_timeout_h=0))
 
     # ---- item 3: fidelidade segura o envio ----
+    def _expire_stage2(self, claim):
+        self.awaiting()
+        vid = self.video()["id"]
+        self.assertEqual(self.cuts(vid).status_code, 202)
+        if claim:
+            self.claim()
+        with self.store.db() as db:
+            db.execute("UPDATE tasks SET deadline=0 WHERE id=?", (self.video()["task_id"],))
+        self.engine.videos.reconcile()
+        video = self.video()
+        self.assertEqual((video["state"], video["credits"], self.sent), ("edit_failed", 15, []))
+        self.assertEqual(self.engine.videos.get(vid)["label"], "falha na edição, nada enviado")
+        self.assertEqual(self.engine.videos.used_today(), 15)  # créditos da etapa 1 seguem contados
+        self.assertIn("edit_failed", self.engine.videos.get(vid)["state"])
+
+    def test_item1_stage2_task_expiring_queued_keeps_credits(self):
+        self._expire_stage2(claim=False)
+
+    def test_item1_stage2_task_expiring_working_keeps_credits(self):
+        self._expire_stage2(claim=True)
+
     def test_item3_fidelity_failed_keeps_clips_and_sends_nothing(self):
         self.awaiting()
         task = self.stage2_task()
