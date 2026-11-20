@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from analysis import DATA_RULES
-from content import (CAPTION_LIMIT, CLOSING, FORBIDDEN_CLAIMS, MODERN_NARRATION_WORDS, SCRIPT_FIELD_LIMIT, VIDEO_SECONDS,
+from content import (band_from_settings, CAPTION_LIMIT, CLOSING, FORBIDDEN_CLAIMS, MODERN_NARRATION_WORDS, SCRIPT_FIELD_LIMIT, VIDEO_SECONDS,
                      CaptionTooLong, _digits, _folded, caption_text, copy_problems, has_emoji, modern_script_problems,
                      opening, script_problems, spoken_numbers, text_length, video_caption)
 from video import ACTIVE, Videos, badge
@@ -75,9 +75,9 @@ SCRIPT_STYLES = {
     "classico": dict(label="Clássico",
                      text="Gancho, demonstração, prova e chamada, com a legenda da narração."),
 }
-# A fala do estilo "problema" é mais curta que a do automático (18–25): em ~2,3 palavras/s, 14–19 palavras terminam
-# entre 6 e 8 s e sobram ~2 s só com o produto inteiro no quadro — sem isso o vídeo "acaba do nada".
-PROBLEM_NARRATION_WORDS = (14, 19)
+# Padrão v3: a mesma faixa (~25 palavras, script_words_target) vale para os dois estilos; a fala termina por volta de
+# 10–13 s e os últimos ~2 s ficam só com som ambiente.
+PROBLEM_NARRATION_WORDS = MODERN_NARRATION_WORDS
 CALLOUTS = 3
 CALLOUT_LIMIT = 26
 CALLOUT_ROLES = ("a dor · 0–3 s", "a virada · 3–6 s", "não perca · 6–10 s")
@@ -242,8 +242,8 @@ def facts_text(output):
     return text
 
 
-def scripts_prompt(product, facts, video_format, banned, names):
-    low, high = MODERN_NARRATION_WORDS
+def scripts_prompt(product, facts, video_format, banned, names, words=None):
+    low, high = words or MODERN_NARRATION_WORDS
     person, speaks = video_format in PERSON_FORMATS, video_format in SPEAKING_FORMATS
     banned_text = ", ".join(f'"{o}"' for o in banned) or "nenhuma"
     people = ("Aparece uma pessoa. Descreva-a uma vez no \"hook\" (idade aproximada, cabelo, roupa simples, onde está) "
@@ -288,9 +288,8 @@ sem emojis, sem preço, desconto, frete ou urgência; "hashtags" = 2 ou 3 (produ
 Responda somente com o JSON do schema."""
 
 
-def problem_scripts_prompt(product, facts, video_format, banned, names):
+def problem_scripts_prompt(product, facts, video_format, banned, names, words=None):
     """Estilo "problema": anúncio curtíssimo que parte de uma dor real, câmera que prende o olhar, 3 chamadas na tela."""
-    low, high = MODERN_NARRATION_WORDS
     person, speaks = video_format in PERSON_FORMATS, video_format in SPEAKING_FORMATS
     banned_text = ", ".join(f'"{o}"' for o in banned) or "nenhuma"
     people = ("Aparece uma pessoa. Descreva-a uma vez no \"hook\" (idade aproximada, cabelo, roupa simples, onde está) "
@@ -299,7 +298,7 @@ def problem_scripts_prompt(product, facts, video_format, banned, names):
               "Só mãos em cena (visão em primeira pessoa ou close): nenhum rosto, sorriso ou pessoa de frente para a câmera.")
     voice = ("A fala é da pessoa em cena, olhando para a câmera, em tom de conversa (como quem avisa uma amiga)."
              if speaks else "A fala é uma voz em off, natural e com energia.")
-    low, high = PROBLEM_NARRATION_WORDS
+    low, high = words or PROBLEM_NARRATION_WORDS
     return f"""Você cria anúncios curtíssimos ({VIDEO_SECONDS} s, vertical 9:16) para a Shopee Vídeo. Quem assiste está
 rolando o feed e decide em 1 segundo se para. O vídeo é feito por uma IA que recebe as fotos do produto como referência
 ({", ".join(names)}).
@@ -383,11 +382,11 @@ def callout_issues(callouts, name):
     return problems
 
 
-def script_issues(script, name, video_format, banned=(), style="classico"):
+def script_issues(script, name, video_format, banned=(), style="classico", words=None):
     """Problems of one script under the Studio rules (the same as the Modern mode, faces allowed in 'provador')."""
-    problems = script_problems(script)
+    problems = script_problems(script, words[1] if words else None)
     problems += modern_script_problems(script, name, banned, hands_only=video_format not in PERSON_FORMATS,
-                                      words=PROBLEM_NARRATION_WORDS if style == "problema" else None)
+                                      words=words or (PROBLEM_NARRATION_WORDS if style == "problema" else None))
     angle = script.get("angle")
     if not isinstance(angle, str) or not angle.strip() or len(angle) > ANGLE_LIMIT:
         problems.append(f"angle vazio ou com mais de {ANGLE_LIMIT} caracteres")
@@ -396,7 +395,7 @@ def script_issues(script, name, video_format, banned=(), style="classico"):
     return problems
 
 
-def scripts_check(name, video_format, banned, style="classico"):
+def scripts_check(name, video_format, banned, style="classico", words=None):
     def check(output):
         if not isinstance(output, dict):
             return ["resposta não é um objeto JSON"]
@@ -405,7 +404,7 @@ def scripts_check(name, video_format, banned, style="classico"):
         if not isinstance(scripts, list) or len(scripts) != 3 or not all(isinstance(s, dict) for s in scripts):
             return problems + ["scripts deve ter exatamente 3 roteiros"]
         for index, script in enumerate(scripts, 1):
-            problems += [f"roteiro {index}: {p}" for p in script_issues(script, name, video_format, banned, style)]
+            problems += [f"roteiro {index}: {p}" for p in script_issues(script, name, video_format, banned, style, words)]
         openings = [opening(s.get("narration") or "") for s in scripts]
         if len(set(openings)) < len(openings):
             problems.append("os 3 roteiros precisam começar a narração de jeitos diferentes")
@@ -793,10 +792,11 @@ class Studio:
         banned = self.store.recent_creative(8)["openings"][:8]
         problem = style == "problema"
         prompt = problem_scripts_prompt if problem else scripts_prompt
+        band = band_from_settings(self.store.settings())
         output, provider, _ = self.engine.runner.run(
-            prompt(product, row["facts"] or "", video_format, banned, [i["name"] for i in images]),
+            prompt(product, row["facts"] or "", video_format, banned, [i["name"] for i in images], band),
             PROBLEM_SCRIPTS_SCHEMA if problem else SCRIPTS_SCHEMA, images,
-            scripts_check(product["name"], video_format, banned, style),
+            scripts_check(product["name"], video_format, banned, style, band),
             log=lambda m: self.store.log("info", "Modelo: " + m), deadline=time.time() + SCRIPTS_SECONDS)
         items = []
         for script in output["scripts"]:
@@ -1011,7 +1011,8 @@ class Studio:
         script_format = scripts.get("format") or video_format
         style = scripts.get("style") or "classico"  # drafts written before the styles existed are "classico"
         for script in scripts.get("items") or []:
-            problems = script_issues(script, product["name"], script_format, scripts.get("banned") or (), style)
+            band = band_from_settings(self.store.settings())
+            problems = script_issues(script, product["name"], script_format, scripts.get("banned") or (), style, band)
             items.append(dict(script, problems=problems, words=len(script.get("narration", "").split())))
         caption = scripts.get("caption")
         if caption:
@@ -1047,7 +1048,7 @@ class Studio:
                     format_label=format_label(video_format) if video_format else "",
                     scripts=items, scripts_format=scripts.get("format"), provider=scripts.get("provider"),
                     scripts_style=style if items else None,
-                    narration_words=list(PROBLEM_NARRATION_WORDS if style == "problema" else MODERN_NARRATION_WORDS),
+                    narration_words=list(band_from_settings(settings)),
                     caption=caption, chosen=chosen, prompt=prompt, job=job, reservation=reservation,
                     video=videos[0] if videos else None, videos=videos[:10], generation=generation,
                     created=row["created"], updated=row["updated"])

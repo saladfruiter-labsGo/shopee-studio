@@ -40,13 +40,13 @@ SCRIPTS_OUTPUT = dict(description="Mantém os alimentos frescos e a geladeira or
 CALLOUTS = [["CHEGA DE POTE VAZANDO", "FECHA COM UM CLIQUE", "NÃO FIQUE SEM O SEU"],
             ["GELADEIRA BAGUNÇADA?", "TUDO NO LUGAR", "SUA COZINHA PEDE ISSO"],
             ["BOLSA MOLHADA DE NOVO?", "NADA VAZA", "SEM ELE NÃO DÁ"]]
-# Estilo "problema": cada fala cabe em 14–19 palavras (o vídeo tem 10 s e o fim precisa de ~2 s de respiro).
+# Padrão v3: cada fala tem ~25 palavras (22–28) e o clipe de 15 s deixa ~2 s finais só com som ambiente.
 PROBLEM_SCRIPTS = [
-    dict(SCRIPTS[0], narration="Cansado de bagunça na cozinha? Este pote fecha com um clique e mantém tudo fresco. "
+    dict(SCRIPTS[0], narration="Cansado de bagunça na cozinha? Este pote fecha com um clique e mantém tudo fresco por muito mais tempo. "
                               "Toque no produto marcado."),
-    dict(SCRIPTS[1], narration="Sabe aquele pote que vaza? Este aqui veda com um clique e organiza a geladeira. "
+    dict(SCRIPTS[1], narration="Sabe aquele pote que vaza? Este aqui veda com um clique e organiza a geladeira inteira sem esforço. "
                                "Toque no produto marcado."),
-    dict(SCRIPTS[2], narration="Repara como a tampa trava e segura o líquido sem vazar na bolsa. "
+    dict(SCRIPTS[2], narration="Repara como a tampa trava e segura o líquido sem vazar na bolsa, mesmo balançando o dia inteiro. "
                                "Toque no produto marcado."),
 ]
 FACTS_OUTPUT = dict(facts=["Pote transparente com tampa azul", "Quatro travas laterais na tampa",
@@ -64,7 +64,7 @@ class StudioRunner:
             raise self.error
         output = SCRIPTS_OUTPUT if "scripts" in schema["properties"] else FACTS_OUTPUT
         if "callouts" in schema["properties"].get("scripts", {}).get("items", {}).get("properties", {}):
-            # Estilo "problema": fala mais curta (14–19 palavras) para sobrar respiro no fim e as 3 chamadas.
+            # Padrão v3: faixa de ~25 palavras também no estilo "problema".
             output = dict(output, scripts=[dict(PROBLEM_SCRIPTS[i], callouts=CALLOUTS[i]) for i in range(len(SCRIPTS))])
         assert check(output) == [], check(output)
         return json.loads(json.dumps(output)), "Fake", ["Fake: ok"]
@@ -120,6 +120,7 @@ class StudioTest(unittest.TestCase):
             self.app = create_app(self.temp.name, testing=True)
         self.client = self.app.test_client()
         self.store, self.engine = self.app.extensions["store"], self.app.extensions["engine"]
+        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         # Product 3 scores best, then 2, then 1 (more sales).
         self.engine.fetcher = lambda _: [node(i, sales=100 * i, imageUrl=f"https://down-br.img.susercontent.com/file/{i}")
                                          for i in range(1, 4)]

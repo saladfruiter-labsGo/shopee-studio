@@ -105,6 +105,7 @@ class EngineTest(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store=Store(self.temp.name)
+        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         # top_count explícito: o padrão (3, D9) muda com o produto; estes testes foram escritos para 5.
         self.store.save_settings(dict(schedule_enabled=True,auto_send=False,top_count=5))
         sleeper=patch("core.time.sleep")
@@ -236,6 +237,7 @@ class ApiTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         with patch.dict(os.environ,{"PANEL_PASSWORD":"test-password-only"}):
             self.app=create_app(self.temp.name,testing=True)
+        self.app.extensions["store"].save_settings(dict(video_daily_credits=75, video_cost=15))
         self.client=self.app.test_client()
         self.app.extensions["engine"].fetcher=lambda _: [node()]
         self.app.extensions["engine"].searcher=lambda *args: []

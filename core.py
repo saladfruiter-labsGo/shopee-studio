@@ -32,7 +32,7 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 top_count=3, commission_weight=50, rating_weight=30, sales_weight=20,
                 schedule_time="12:00", schedule_enabled=True, auto_send=False,
                 max_pages=100, page_limit=20,
-                video_enabled=True, video_daily_credits=75, video_cost=15, video_model="Omni 1.1 Flash",
+                video_enabled=True, video_daily_credits=0, video_cost=60, video_model="Omni 1.1 Flash",
                 flow_project_url="",
                 # "legacy" = behaviour before the Modern mode; "modern" = PLANO_MODO_MODERNO.md.
                 mode="legacy",
@@ -44,7 +44,12 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 sales_snapshot=True, snapshot_time="07:00",
                 # Estúdio (PLANO_ESTUDIO.md): the best N products of each send wait for the user; without any
                 # generation by the cutoff they fall back to the automatic video. 0 = off (behaviour unchanged).
-                studio_slots=0, studio_cutoff="22:00")
+                studio_slots=0, studio_cutoff="22:00",
+                # Padrão v3 (issue #14). video_cost = video_clip_cost_expected da spec (créditos esperados por clipe);
+                # video_daily_credits = 0 recusa toda geração real até o igaoeu definir o teto.
+                script_words_target=25, script_words_tol=3,
+                edit_min_s=10.0, edit_max_s=12.0, hook_end_s=6.0, shot_target_s=2.0, shot_tol_s=0.5,
+                static_max_s=1.5, word_margin_s=0.05, lead_silence_max_s=0.3)
 MODES = {"legacy", "modern"}
 DECISIONS = {"new", "planned", "published", "discarded"}
 API = "https://open-api.affiliate.shopee.com.br/graphql"
@@ -149,9 +154,18 @@ def validate_settings(payload, existing=None):
     for key, low, high in (("repeat_days", 0, 365), ("top_count", 1, 10),
                            ("per_shop", 1, 10), ("studio_slots", 0, 10),
                            ("max_pages", 1, 500), ("page_limit", 1, 50),
-                           ("video_daily_credits", 0, 2000), ("video_cost", 1, 500)):
+                           ("video_daily_credits", 0, 2000), ("video_cost", 1, 500),
+                           ("script_words_target", 5, 80), ("script_words_tol", 0, 20)):
         if not low <= result[key] <= high:
             raise ValueError(f"{key}: use {low} a {high}.")
+    for key in ("edit_min_s", "edit_max_s", "hook_end_s", "shot_target_s", "shot_tol_s", "static_max_s"):
+        if not 0 < result[key] <= 60:
+            raise ValueError(f"{key}: use um valor entre 0 e 60 segundos.")
+    for key in ("word_margin_s", "lead_silence_max_s"):
+        if not 0 <= result[key] <= 5:
+            raise ValueError(f"{key}: use um valor entre 0 e 5 segundos.")
+    if result["edit_min_s"] > result["edit_max_s"]:
+        raise ValueError("edit_min_s não pode superar edit_max_s.")
     weights = [result[k] for k in ("commission_weight", "rating_weight", "sales_weight")]
     if any(w < 0 or w > 100 for w in weights) or sum(weights) != 100:
         raise ValueError("Os pesos devem somar 100%.")

@@ -35,6 +35,7 @@ class VideoTest(unittest.TestCase):
             self.app = create_app(self.temp.name, testing=True)
         self.client = self.app.test_client()
         self.store, self.engine = self.app.extensions["store"], self.app.extensions["engine"]
+        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         self.engine.fetcher = lambda _: [node(i, imageUrl=f"https://down-br.img.susercontent.com/file/{i}") for i in range(1, 4)]
         self.engine.searcher = lambda *a: []
         self.engine.runner = FakeRunner()
@@ -101,7 +102,7 @@ class VideoTest(unittest.TestCase):
         task = self.claim()
         payload = task["payload"]
         self.assertEqual((payload["model"], payload["expected_cost"], payload["project_url"]), ("Omni 1.1 Flash", 15, PROJECT))
-        self.assertIn("10 segundos", payload["prompt"])
+        self.assertIn("15 segundos", payload["prompt"])
         self.assertTrue(payload["narration"])
         self.assertTrue(payload["image_url"].startswith("https://down-br.img.susercontent.com/"))
 
@@ -148,6 +149,16 @@ class VideoTest(unittest.TestCase):
         self.finish(self.claim())
         self.assertIn("Mantém os alimentos frescos", self.sent[0][1]["caption"])
         self.assertNotIn("alterado", self.sent[0][1]["caption"])
+
+    def test_default_budget_is_zero_and_refuses_every_real_generation(self):
+        """Padrão v3: video_daily_credits = 0 (config) recusa toda geração real; nenhum crédito é reservado."""
+        from core import DEFAULTS
+        self.assertEqual((DEFAULTS["video_daily_credits"], DEFAULTS["video_cost"]), (0, 60))
+        self.store.save_settings(dict(video_daily_credits=0, video_cost=60))
+        self.deliver()
+        self.assertEqual([(v["state"], v["credits"]) for v in self.videos()], [("skipped", 0)] * 3)
+        self.assertTrue(all("teto diário de 0 créditos" in v["error"] for v in self.videos()))
+        self.assertEqual(self.sent, [])
 
     def test_cap_disabled_and_missing_project_leave_products_failed_without_messages(self):
         self.store.save_settings(dict(video_daily_credits=20))

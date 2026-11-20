@@ -5,9 +5,25 @@ import unicodedata
 
 CAPTION_LIMIT = 150          # description + hashtags, defined by the user
 TELEGRAM_CAPTION_LIMIT = 1024  # sendVideo caption: 0-1024 characters after entities parsing (Bot API)
-VIDEO_SECONDS = 10
+VIDEO_SECONDS = 15           # padrão v3: 1 clipe de 15 s com a fala nativa do Flow
 MAX_LINKS = 6                # selected listing + up to 5 validated equivalents
-NARRATION_MAX_WORDS = 25
+SCRIPT_WORDS_TARGET = 25     # script_words_target (config): ~25 palavras de fala para 15 s
+SCRIPT_WORDS_TOL = 3         # script_words_tol (config): tolerância em palavras para cima e para baixo
+
+
+def narration_band(target=SCRIPT_WORDS_TARGET, tol=SCRIPT_WORDS_TOL):
+    """Faixa (mín., máx.) de palavras da fala: parâmetro de configuração, nunca um número fixo no roteirista."""
+    target, tol = int(target), int(tol)
+    return max(1, target - tol), target + tol
+
+
+def band_from_settings(settings):
+    """Faixa de palavras vinda da configuração (script_words_target / script_words_tol)."""
+    return narration_band(settings.get("script_words_target", SCRIPT_WORDS_TARGET),
+                          settings.get("script_words_tol", SCRIPT_WORDS_TOL))
+
+
+NARRATION_MAX_WORDS = narration_band()[1]
 SCRIPT_FIELD_LIMIT = 220
 FORBIDDEN_TAGS = {"shopee", "achadinhos", "achadinho", "achados", "viral", "fyp", "foryou",
                   "foryoupage", "parati", "pravoce", "tiktok", "shopeevideo", "promo", "promocao"}
@@ -68,7 +84,7 @@ def copy_problems(description, hashtags, limit=CAPTION_LIMIT):
     return problems
 
 
-def script_problems(script):
+def script_problems(script, max_words=None):
     problems = []
     for field in ("hook", "demo", "benefit", "cta", "narration"):
         value = script.get(field)
@@ -79,8 +95,9 @@ def script_problems(script):
         elif FORBIDDEN_CLAIMS.search(value):
             problems.append(f"{field}: não cite preço, desconto, frete, estoque ou urgência")
     narration = script.get("narration")
-    if isinstance(narration, str) and len(narration.split()) > NARRATION_MAX_WORDS:
-        problems.append(f"narração com mais de {NARRATION_MAX_WORDS} palavras não cabe em {VIDEO_SECONDS} s")
+    limit = max_words or NARRATION_MAX_WORDS
+    if isinstance(narration, str) and len(narration.split()) > limit:
+        problems.append(f"narração com mais de {limit} palavras não cabe em {VIDEO_SECONDS} s")
     return problems
 
 
@@ -180,7 +197,7 @@ FORMATS = {
     "teste_desafio": "teste ou desafio — mãos pondo o produto à prova de forma honesta e visível.",
     "detalhes_macro": "detalhes em macro — closes de textura, acabamento e encaixes, terminando em uso.",
 }
-MODERN_NARRATION_WORDS = (18, 25)
+MODERN_NARRATION_WORDS = narration_band()
 FORBIDDEN_OPENINGS = {"olha", "gente"}
 CLOSING = "produto marcado"
 FACE = re.compile(r"\b(rostos?|sorri\w*|selfie|olhando para a camera|encara a camera|de frente para a camera)\b")

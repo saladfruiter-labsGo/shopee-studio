@@ -232,6 +232,7 @@ class EngineModernTest(unittest.TestCase):
         sleeper.start()
         self.addCleanup(sleeper.stop)
         self.store = Store(self.temp.name)
+        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         # top_count explícito: o padrão (3, D9) muda com o produto; estes testes foram escritos para 5.
         self.store.save_settings(dict(mode="modern", flow_project_url=PROJECT, top_count=5))
         self.top_calls = 0
@@ -346,11 +347,11 @@ class ScriptTest(unittest.TestCase):
         return modern_script_problems(script, self.NAME, openings)
 
     def test_valid_narration(self):
-        text = "Doze réguas de noventa e um por quinze transformam o piso em minutos, sem obra. Toque no produto marcado."
+        text = "Doze réguas de noventa e um por quinze transformam o piso em minutos, sem obra nem sujeira, e a sala fica linda de verdade. Toque no produto marcado."
         self.assertEqual(self.problems(text), [])
 
     def test_rules(self):
-        good = "Esse piso transforma a sala em minutos, sem obra nem sujeira, e fica lindo de verdade. Toque no produto marcado."
+        good = "Esse piso transforma a sala em minutos, sem obra nem sujeira, e fica lindo de verdade para receber visita em casa hoje. Toque no produto marcado."
         self.assertEqual(self.problems(good), [])
         self.assertTrue(any("número falado" in p and "20" in p for p in
                             self.problems(good.replace("Esse piso", "Vinte réguas"))))
@@ -398,6 +399,7 @@ class VideoModernTest(unittest.TestCase):
             self.app = create_app(self.temp.name, testing=True)
         self.client = self.app.test_client()
         self.store, self.engine = self.app.extensions["store"], self.app.extensions["engine"]
+        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         self.engine.modern_fetcher = lambda s: dict(nodes=[mnode(i) for i in range(1, 4)], warnings=[])
         self.engine.top_fetcher = lambda s: set()
         self.engine.searcher = lambda *a, **k: dict(nodes=[], pageInfo={})
