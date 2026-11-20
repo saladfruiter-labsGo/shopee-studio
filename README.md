@@ -195,8 +195,8 @@ O volume shopee-studio_shopee-data guarda banco e chave de sessão. Faça backup
 ## Atualizações GitHub → Unraid
 
 Cada push na branch main executa os testes e publica:
-- ghcr.io/saladfruiter/shopee-studio:latest
-- ghcr.io/saladfruiter/shopee-studio:sha-COMMIT_COMPLETO
+- ghcr.io/saladfruiter-labsgo/shopee-studio:latest
+- ghcr.io/saladfruiter-labsgo/shopee-studio:sha-COMMIT_COMPLETO
 
 A stack de produção usa image:, sem build local. O Compose Manager pode comparar a imagem instalada com a imagem publicada e exibir atualização disponível ao usar Check for Updates. No Compose Manager Plus, habilite Auto Check for Updates e selecione Every Time para consultar ao abrir a página de stacks. Os demais intervalos limitam a frequência dessa consulta; a opção descreve uma checagem ao carregar a página, não um monitor em segundo plano. Uma alteração só fica disponível quando o workflow termina com sucesso.
 

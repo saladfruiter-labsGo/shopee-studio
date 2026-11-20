@@ -1,7 +1,7 @@
 name: shopee-studio
 services:
   shopee-studio:
-    image: ghcr.io/saladfruiter/shopee-studio:latest
+    image: ghcr.io/saladfruiter-labsgo/shopee-studio:latest
     container_name: shopee-studio
     restart: unless-stopped
     init: true
