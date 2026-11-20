@@ -179,8 +179,13 @@ def process_v3_clip(config, video_id, raw, edit, stage=None, words=None, dry_run
                 ve.save_strategy_and_note(db, video_id, edit.get("strategy"), edit.get("fidelity_note") or {})
             stage("editing")
             transcriber = lambda path: ve.whisper_words(path, config.get("whisper_model", "small"))
-            return ve.edit_clip(db, video_id, clips / "edited", ve.config(edit.get("config")), words, edit.get("cuts") or None,
-                                transcriber=transcriber, dry_run=dry_run)
+            result = ve.edit_clip(db, video_id, clips / "edited", ve.config(edit.get("config")), words, edit.get("cuts") or None,
+                                  transcriber=transcriber, dry_run=dry_run)
+            if edit.get("ficha") and edit.get("use_scene"):  # V3-7: o EDITADO passa pelo portão de fidelidade
+                script = dict(use_scene=edit["use_scene"])
+                result["fidelity"] = ve.fidelity_check(db, video_id, edit["ficha"], script,
+                                                       clips / "frames" / f"video_{video_id}")
+            return result
         except ve.EditError as error:
             wrapped = VideoError("edit_failed", f"{error.code}: {error}", True)
             wrapped.edit_code = error.code
@@ -190,7 +195,8 @@ def process_v3_clip(config, video_id, raw, edit, stage=None, words=None, dry_run
 
 
 def dry_run_edit(argv):
-    """`studio_worker.py --dry-run-edit [--clip MP4] [--words JSON] [--cuts JSON] [--workdir PASTA]`: o fluxo bruto → edição
+    """(sem --clip, usa cortes de fixture; com --clip, --cuts é obrigatório: nenhum corte é inventado)
+    `studio_worker.py --dry-run-edit [--clip MP4] [--words JSON] [--cuts JSON] [--workdir PASTA]`: o fluxo bruto → edição
     sem painel, sem Flow e sem crédito (0). Sem --clip usa um clipe de fixture gerado com ffmpeg. Imprime um JSON."""
     import argparse
     parser = argparse.ArgumentParser(prog="studio_worker --dry-run-edit")
@@ -208,7 +214,7 @@ def dry_run_edit(argv):
         else:
             clip, words_file = Path(args.clip), Path(args.words) if args.words else Path(args.clip).with_suffix(".words.json")
         words = ve.load_words(words_file) if words_file.is_file() else None
-        cuts = json.loads(Path(args.cuts).read_text())["cuts"] if args.cuts else None
+        cuts = json.loads(Path(args.cuts).read_text())["cuts"] if args.cuts else (None if args.clip else [7.0, 9.1, 11.2])
         config = dict(clips_dir=str(work / "clips"), whisper_model="small")
         result = process_v3_clip(config, 1, clip, dict(product_key="dry-run", cuts=cuts), words=words, dry_run=True)
         print(json.dumps(dict(ok=True, dry_run=True, credits=0, **result), ensure_ascii=False))
@@ -264,7 +270,8 @@ def run_video(config, task, worker_id):
         if edit:  # Padrão v3: entrega o bruto, edita só com corte (sem legenda, selo nem texto sobre o vídeo, ED-6)
             result = process_v3_clip(config, task["id"], raw, edit, stage)
             final = Path(result["edited_path"])
-            meta = dict(duration=result["duration"], cuts=result["cuts"], warnings=result["warnings"])
+            meta = dict(duration=result["duration"], cuts=result["cuts"], warnings=result["warnings"],
+                        fidelity=(result.get("fidelity") or {}).get("issues"))
             stage("uploading")
             upload_video(url, token, task["id"], worker_id, final)
             return meta

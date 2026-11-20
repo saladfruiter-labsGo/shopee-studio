@@ -5,7 +5,8 @@ O clipe bruto é a matéria-prima: a edição só corta e encurta (nunca pede ou
 importa o Flow). Roda na hermes, sem rede e sem crédito, e é testável com um clipe de fixture (`make-fixture`).
 
 CLI (ED-14): a saída é SEMPRE um JSON validado por RESULT_SCHEMA; o código de saída diz o resultado:
-  0 ok · 2 argumentos · 3 transcrição falhou · 4 duração/fala fora da faixa · 5 plano parado · 6 ffmpeg · 7 banco.
+  0 ok · 2 argumentos/sem cortes · 3 transcrição falhou · 4 duração/fala fora da faixa · 5 plano parado · 6 ffmpeg · 7 banco
+  · 8 resultado fora do schema (JSON de erro próprio) · 9 nota de fidelidade incompleta.
     video_edit.py deliver-raw --db DB --video-id N --product-key K --raw MP4 --dest DIR      (ED-13)
     video_edit.py edit --db DB --video-id N --out DIR [--words W.json] [--cuts C.json] [--dry-run] [--config J]
     video_edit.py frames --raw MP4 --out DIR                      (quadros a cada 0,5 s para o agente com visão)
@@ -23,9 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULTS = dict(edit_min_s=10.0, edit_max_s=12.0, hook_end_s=6.0, shot_target_s=2.0, shot_tol_s=0.5,
-                static_max_s=1.5, word_margin_s=0.05, lead_silence_max_s=0.3, last_shot_min_s=0.5, last_shot_max_s=1.0)
+                static_max_s=1.5, word_margin_s=0.05, lead_silence_max_s=0.3, last_shot_min_s=0.5, last_shot_max_s=1.0,
+                edit_tolerance_s=0.15)  # ED-1: folga da duração final em relação a edit_min_s/edit_max_s (parâmetro, não literal)
 EXIT = {"ok": 0, "bad_args": 2, "transcription_failed": 3, "speech_too_long": 4, "too_short": 4, "bad_duration": 4,
-        "static_shot": 5, "ffmpeg_failed": 6, "db_error": 7, "no_audio": 4, "raw_missing": 2}
+        "static_shot": 5, "ffmpeg_failed": 6, "db_error": 7, "no_audio": 4, "raw_missing": 2, "cuts_missing": 2,
+        "invalid_result": 8, "fidelity_failed": 9}
 STATUSES = ("raw_delivered", "editing", "edited", "edit_failed")
 
 
@@ -130,15 +133,44 @@ def extract_frames(raw, out_dir, every=0.5):
     return sorted(out.glob("q_*.jpg"))
 
 
-def static_segments(path, min_s):
-    """Trechos congelados (freezedetect) com pelo menos `min_s` segundos — ED-4."""
+def freeze_intervals(path, min_s):
+    """Trechos congelados (freezedetect) com pelo menos `min_s` segundos, como (início, fim) — ED-4."""
     done = run(["ffmpeg", "-v", "info", "-i", str(path), "-vf", f"freezedetect=n=0.003:d={min_s}", "-an",
                 "-f", "null", "-"])
-    durations = [float(m) for m in re.findall(r"freeze_duration: ([0-9.]+)", done.stderr)]
     starts = [float(m) for m in re.findall(r"freeze_start: ([0-9.]+)", done.stderr)]
-    if len(starts) > len(durations):  # congelado até o fim: o ffmpeg não imprime a duração
-        durations.append(probe(path)["duration"] - starts[-1])
-    return durations
+    ends = [float(m) for m in re.findall(r"freeze_end: ([0-9.]+)", done.stderr)]
+    total = None
+    out = []
+    for index, start in enumerate(starts):
+        if index < len(ends):
+            end = ends[index]
+        else:  # congelado até o fim: o ffmpeg não imprime o fim
+            total = total or probe(path)["duration"]
+            end = total
+        out.append((start, end))
+    return out
+
+
+def static_segments(path, min_s):
+    """Durações dos trechos congelados com pelo menos `min_s` segundos."""
+    return [end - start for start, end in freeze_intervals(path, min_s)]
+
+
+def dead_intervals(path, cfg, words):
+    """ED-4: tempo morto = o que passa de static_max_s num plano congelado. Sai do meio do clipe (concat), sem
+    cortar palavra: a borda que cairia dentro de uma fala recua/avança até a pausa mais próxima."""
+    margin, keep = cfg["word_margin_s"], cfg["static_max_s"]
+    dead = []
+    for start, end in freeze_intervals(path, keep):
+        a, b = start + max(0.0, keep - 0.3), end  # folga de 0,3 s: freezedetect e o concat mexem em 1–2 quadros
+        for w in words:
+            if w["start"] - margin < a < w["end"] + margin:
+                a = w["end"] + margin
+            if w["start"] - margin < b < w["end"] + margin:
+                b = w["start"] - margin
+        if b - a > 0.1:
+            dead.append((round(a, 3), round(b, 3)))
+    return dead
 
 
 # ---------- transcrição por palavra (ED-8) ----------
@@ -180,32 +212,14 @@ def slide(t, words, margin, lo, hi):
     return min(ok, key=lambda c: (abs(c - t), c)) if ok else None
 
 
-def nominal_cuts(start, end, cfg):
-    """Instantes alvo (tempo bruto): fim do gancho e depois um plano a cada shot_target_s; último de 0,5–1 s."""
-    hook = start + cfg["hook_end_s"]
-    target, tail_min, tail_max, tol = cfg["shot_target_s"], cfg["last_shot_min_s"], cfg["last_shot_max_s"], cfg["shot_tol_s"]
-    rest = end - hook
-    if rest <= 0:
-        return []
-    count = int(rest // target)
-    leftover = rest - count * target
-    cuts = [hook + target * k for k in range(count + 1)]  # hook, hook+2, ...
-    last_shot_len = leftover
-    if leftover < tail_min:
-        if count:  # sobra pequena: absorvida pelo plano anterior
-            cuts.pop()
-        last_shot_len = None
-    elif leftover > tail_max:
-        if leftover >= target - tol:  # plano regular mais curto (≥ target - tol)
-            pass
-        else:  # entre tail_max e target - tol: último fica com tail_max e o anterior absorve o resto
-            cuts[-1] = end - tail_max
-    cuts = [c for c in cuts if start < c < end - 1e-6]
-    return cuts
+def plan_cuts(duration, words, cfg, proposed=None, dead=()):
+    """Define janela (início/fim no bruto) e cortes. Devolve dict(start, end, cuts, shots, keep, warnings).
 
-
-def plan_cuts(duration, words, cfg, proposed=None):
-    """Define janela (início/fim no bruto) e cortes. Devolve dict(start, end, cuts, shots, warnings)."""
+    Os cortes de plano vêm SEMPRE de fora (`proposed`, ED-9: a rotina do agente olha os quadros): este módulo não
+    inventa cortes de 2 s. `dead` = tempo morto a tirar do meio do clipe (ED-4)."""
+    if not proposed:
+        raise EditError("cuts_missing", "Sem --cuts: os cortes de plano vêm da rotina do agente com visão (ED-9); "
+                                        "nenhum corte é inventado aqui.")
     if not words:
         raise EditError("transcription_failed", "Sem palavras na transcrição; a etapa não envia (ED-8).")
     margin, warnings = cfg["word_margin_s"], []
@@ -219,19 +233,19 @@ def plan_cuts(duration, words, cfg, proposed=None):
                                            f"{cfg['edit_max_s']:.0f} s sem cortar palavra (ED-1/ED-7).")
     length = min(max(need_end - start + 0.4, cfg["edit_min_s"]), cfg["edit_max_s"])
     end = start + length
+    removed = sum(max(0.0, min(b, end) - max(a, start)) for a, b in dead)   # tempo morto a retirar: a janela cresce para compensar
+    end = min(start + length + removed, duration)
     if end > duration + 1e-6:
         end = duration
         if end - start < cfg["edit_min_s"] - 1e-6:
             raise EditError("too_short", f"O bruto (de {start:.2f} s a {duration:.2f} s) não rende {cfg['edit_min_s']:.0f} s.")
-    targets = sorted(proposed) if proposed else nominal_cuts(start, end, cfg)
+    targets = sorted(proposed)
     tol, cuts = cfg["shot_tol_s"], []
     for index, t in enumerate(targets):
         if not start + cfg["last_shot_min_s"] <= t <= end - cfg["last_shot_min_s"]:
             warnings.append(f"corte em {t:.2f} s fora da janela editada; descartado")
             continue
         lo, hi = t - tol, t + tol
-        if not proposed and index == 0:  # ED-2: o gancho acaba até hook_end_s
-            hi = t
         moved = slide(t, words, margin, max(lo, start + 0.1), min(hi, end - 0.1))
         if moved is None:
             warnings.append(f"corte em {t:.2f} s cairia dentro de uma palavra e não há pausa em ±{tol:g} s; descartado (ED-8)")
@@ -249,14 +263,32 @@ def plan_cuts(duration, words, cfg, proposed=None):
         if not (abs(size - cfg["shot_target_s"]) <= tol + 1e-6 or
                 (is_last and cfg["last_shot_min_s"] - 1e-6 <= size <= cfg["last_shot_max_s"] + 1e-6)):
             warnings.append(f"plano {number} com {size:.2f} s fora de {cfg['shot_target_s']:g}±{tol:g} s")
-    return dict(start=start, end=end, cuts=cuts, shots=shots, warnings=warnings)
+    keep, cursor = [], start
+    for a, b in sorted(dead):
+        a, b = max(a, start), min(b, end)
+        if b - a > 1e-6:
+            keep.append((cursor, a))
+            cursor = b
+    keep.append((cursor, end))
+    keep = [(a, b) for a, b in keep if b - a > 1e-6]
+    return dict(start=start, end=end, cuts=cuts, shots=shots, keep=keep, warnings=warnings)
 
 
-def build_command(raw, out, start, end):
-    """ED-6/ED-7: só corte e recodificação; nenhum filtro de vídeo (drawtext/subtitles/overlay) e áudio nativo mantido."""
-    return ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-i", str(raw),
-            "-map", "0:v:0", "-map", "0:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)]
+def build_command(raw, out, start, end, keep=None):
+    """ED-6/ED-7: só corte (e concat do tempo morto, ED-4) e recodificação; nenhum filtro de vídeo de texto/imagem
+    (drawtext/subtitles/overlay) e áudio nativo mantido."""
+    keep = keep or [(start, end)]
+    tail = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", str(out)]
+    if len(keep) == 1:
+        a, b = keep[0]
+        return ["ffmpeg", "-y", "-v", "error", "-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", str(raw),
+                "-map", "0:v:0", "-map", "0:a:0"] + tail
+    parts = "".join(f"[0:v]trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}];"
+                    f"[0:a]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[a{i}];" for i, (a, b) in enumerate(keep))
+    joined = "".join(f"[v{i}][a{i}]" for i in range(len(keep)))
+    graph = f"{parts}{joined}concat=n={len(keep)}:v=1:a=1[v][a]"
+    return ["ffmpeg", "-y", "-v", "error", "-i", str(raw), "-filter_complex", graph, "-map", "[v]", "-map", "[a]"] + tail
 
 
 # ---------- orquestração (ED-11) ----------
@@ -273,13 +305,15 @@ def edit_clip(db, video_id, out_dir, cfg=None, words=None, proposed=None, transc
         if not info["has_audio"]:
             raise EditError("no_audio", "O bruto não tem áudio; a fala nativa precisa estar no clipe (ED-7).")
         words = words if words is not None else transcriber(raw)
-        plan = plan_cuts(info["duration"], words, cfg, proposed)
+        dead = dead_intervals(raw, cfg, words) if proposed else []
+        plan = plan_cuts(info["duration"], words, cfg, proposed, dead)
         out.parent.mkdir(parents=True, exist_ok=True)
-        done = run(build_command(raw, out, plan["start"], plan["end"]))
+        done = run(build_command(raw, out, plan["start"], plan["end"], plan["keep"]))
         if done.returncode or not out.is_file():
             raise EditError("ffmpeg_failed", "ffmpeg falhou: " + done.stderr[-200:])
         result = probe(out)
-        if not (cfg["edit_min_s"] - 0.15 <= result["duration"] <= cfg["edit_max_s"] + 0.15):
+        tolerance = cfg["edit_tolerance_s"]
+        if not (cfg["edit_min_s"] - tolerance <= result["duration"] <= cfg["edit_max_s"] + tolerance):
             raise EditError("bad_duration", f"Duração final {result['duration']:.2f} s fora de "
                                             f"{cfg['edit_min_s']:g}–{cfg['edit_max_s']:g} s (ED-1).")
         if not result["has_audio"]:
@@ -294,7 +328,23 @@ def edit_clip(db, video_id, out_dir, cfg=None, words=None, proposed=None, transc
     _upsert(db, video_id, status="edited", edited_path=str(out), cuts=json.dumps(plan["shots"]), credits=0)
     return dict(video_id=video_id, status="edited", raw_path=str(raw), edited_path=str(out),
                 duration=round(result["duration"], 3), cuts=plan["shots"], warnings=plan["warnings"],
+                dead_removed=[list(d) for d in dead],
                 lead_silence_s=round(words[0]["start"] - plan["start"], 3))
+
+
+# ---------- fidelidade do EDITADO (V3-7) ----------
+def fidelity_check(db, video_id, ficha, script, frames_dir=None):
+    """Roda o vídeo editado pelo portão de fidelidade: quadros do editado para a rotina com visão (se `frames_dir`) e,
+    se já há nota gravada, `v3.fidelity_issues` (cor por parte, ação das móveis, trajeto, destino). Sem nota: pendente."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from v3 import fidelity_issues, fidelity_prompt
+    clip = get_clip(db, video_id)
+    if not clip or clip["status"] != "edited" or not clip["edited_path"]:
+        raise EditError("raw_missing", f"Vídeo {video_id} sem editado para conferir.")
+    frames = [str(f) for f in extract_frames(clip["edited_path"], frames_dir)] if frames_dir else []
+    note = json.loads(clip["fidelity_note"]) if clip["fidelity_note"] else None
+    issues = fidelity_issues(note, ficha, script) if note is not None else ["sem nota de fidelidade do editado (pendente)"]
+    return dict(ok=not issues, issues=issues, frames=frames, prompt=fidelity_prompt(ficha, script), score=clip["fidelity_score"])
 
 
 # ---------- JSON da CLI (ED-14) ----------
@@ -335,6 +385,20 @@ def validate(instance, schema, path="$"):
     return errors
 
 
+def emit(video_id, dry_run, ok_payload=None, error=None, clip=None):
+    """ED-14: imprime o JSON da CLI. Se o resultado não passa no schema, imprime um JSON de erro próprio
+    (code=invalid_result, também validado) e devolve o código 8, nunca o JSON inválido."""
+    try:
+        print(json.dumps(result_json(video_id, dry_run, ok_payload, error, clip), ensure_ascii=False))
+        return EXIT.get(error.code, 1) if error else 0
+    except RuntimeError as problem:
+        fallback = EditError("invalid_result", str(problem)[:300])
+        data = dict(ok=False, video_id=video_id, status="failed", raw_path=None, edited_path=None, duration=None, cuts=[],
+                    warnings=[], credits=0, dry_run=bool(dry_run), error=dict(code=fallback.code, message=str(fallback)))
+        print(json.dumps(data, ensure_ascii=False))
+        return EXIT["invalid_result"]
+
+
 def result_json(video_id, dry_run, ok_payload=None, error=None, clip=None):
     clip = clip or {}
     base = dict(ok=error is None, video_id=video_id, status="failed" if error else "edited",
@@ -371,9 +435,9 @@ def make_fixture(out_dir, seconds=15):
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="video_edit")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("deliver-raw", "edit", "frames", "make-fixture"):
+    for name in ("deliver-raw", "edit", "frames", "make-fixture", "fidelity"):
         p = sub.add_parser(name)
-        if name in ("deliver-raw", "edit"):
+        if name in ("deliver-raw", "edit", "fidelity"):
             p.add_argument("--db", required=True)
             p.add_argument("--video-id", type=int, required=True)
         if name == "deliver-raw":
@@ -386,6 +450,10 @@ def main(argv=None):
             p.add_argument("--cuts")
             p.add_argument("--config")
             p.add_argument("--dry-run", action="store_true")
+        if name == "fidelity":
+            p.add_argument("--ficha", required=True)
+            p.add_argument("--script", required=True)
+            p.add_argument("--frames-out")
         if name == "frames":
             p.add_argument("--raw", required=True)
         if name in ("frames", "make-fixture"):
@@ -408,12 +476,16 @@ def main(argv=None):
             db = connect(args.db)
         except sqlite3.Error as error:
             raise EditError("db_error", str(error)) from None
+        if args.command == "fidelity":
+            result = fidelity_check(db, args.video_id, json.loads(Path(args.ficha).read_text()),
+                                    json.loads(Path(args.script).read_text()), args.frames_out)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result["ok"] else EXIT["fidelity_failed"]
         if args.command == "deliver-raw":
             path = deliver_raw(db, args.video_id, args.product_key, args.raw, args.dest)
             clip = get_clip(db, args.video_id)
             payload = dict(status="raw_delivered", raw_path=path, edited_path=None, duration=None, cuts=[], warnings=[])
-            print(json.dumps(result_json(video_id, False, payload, clip=clip), ensure_ascii=False))
-            return 0
+            return emit(video_id, False, payload, clip=clip)
         cfg = config(json.loads(args.config) if args.config else None)
         clip = get_clip(db, video_id) or {}
         words = load_words(args.words) if args.words else None
@@ -423,16 +495,12 @@ def main(argv=None):
             words = load_words(sidecar) if dry_run and sidecar and sidecar.is_file() else None
         proposed = json.loads(Path(args.cuts).read_text())["cuts"] if args.cuts else None
         payload = edit_clip(db, video_id, args.out, cfg, words, proposed, dry_run=dry_run)
-        print(json.dumps(result_json(video_id, dry_run, payload, clip=get_clip(db, video_id)), ensure_ascii=False))
-        return 0
+        return emit(video_id, dry_run, payload, clip=get_clip(db, video_id))
     except EditError as error:
         clip = get_clip(db, video_id) if db and video_id else None
-        print(json.dumps(result_json(video_id, dry_run, error=error, clip=clip), ensure_ascii=False))
-        return EXIT.get(error.code, 1)
+        return emit(video_id, dry_run, error=error, clip=clip)
     except (ValueError, KeyError, OSError) as error:  # arquivo de palavras/config inválido
-        err = EditError("bad_args", f"entrada inválida: {error}")
-        print(json.dumps(result_json(video_id, dry_run, error=err), ensure_ascii=False))
-        return 2
+        return emit(video_id, dry_run, error=EditError("bad_args", f"entrada inválida: {error}"))
     finally:
         if db:
             db.close()

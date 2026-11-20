@@ -43,18 +43,20 @@ Quando o payload da tarefa de vídeo traz o bloco `edit`, o worker **não** lege
 3. `edit_clip` corta com ffmpeg em 10–12 s, mantém o áudio nativo e grava bruto, editado e lista de cortes (`status=edited`). Só o editado é enviado ao painel.
 4. Falha na edição (ED-11, inclusive sem transcrição por palavra, ED-8): o bruto fica, `status=edit_failed`, crédito 0, **nada é enviado** e a tarefa devolve `edit_failed` (cobrada, sem regerar).
 
-Bloco `edit` do payload: `product_key`, `strategy` e `fidelity_note` (V3-8, gravados no SQLite), `cuts` (tempos em segundos escolhidos com visão, ED-9) e `config` (faixas da edição, ex.: `edit_min_s`, `edit_max_s`).
+Bloco `edit` do payload: `product_key`, `ficha` e `use_scene` (do roteirista v3), `strategy` e `fidelity_note` (V3-8, gravados no SQLite), `cuts` (tempos em segundos escolhidos com visão, ED-9) e `config` (parâmetros da edição, todos vindos da configuração do painel: `edit_min_s`, `edit_max_s`, `hook_end_s`, `shot_target_s`, `shot_tol_s`, `static_max_s`, `word_margin_s`, `lead_silence_max_s` e `edit_tolerance_s`).
 
-**Quem orquestra a visão (a rotina do agente).** O worker não tem visão. Quem decide os cortes por visão (ED-9) e escreve a nota de fidelidade é a rotina do agente: ela extrai quadros do bruto (`video_edit.py frames --raw X --out D`), olha os quadros e então manda `edit.cuts` e `edit.fidelity_note` no payload da tarefa ou, fora do Flow, chama a CLI `video_edit.py edit --cuts cortes.json`. Sem `cuts`, a edição usa os cortes nominais. A nota nunca é gerada pelo worker.
+**Faixas e custo.** Fala de 15 s com a voz nativa do Flow: a narração segue `script_words_target` ± `script_words_tol` (padrão 25 ± 3 = 22–28 palavras; as faixas antigas 18–25 e 14–19 saíram do automático) e **termina por volta de 11 s**; o editado fica em **10–12 s** (decisão sobre o conflito 10–12 s × 15 s: a fala acaba até ~11 s, então o corte final cabe sem cortar palavra). A tolerância de duração do editado é o parâmetro `edit_tolerance_s` (padrão 0,15 s, ED-1), não um literal. O custo esperado é `video_clip_cost_expected` (padrão 60; `video_cost` continua como apelido) e `video_daily_credits` padrão 0 recusa toda geração real, de qualquer origem. Bancos antigos (15/75) migram uma vez para 60/0.
+
+**Quem orquestra a visão (a rotina do agente).** O worker não tem visão. Quem decide os cortes por visão (ED-9) e escreve a nota de fidelidade é a rotina do agente: ela extrai quadros do bruto (`video_edit.py frames --raw X --out D`), olha os quadros e então manda `edit.cuts` e `edit.fidelity_note` no payload da tarefa ou, fora do Flow, chama a CLI `video_edit.py edit --cuts cortes.json`. **Sem `cuts` a edição falha com `cuts_missing` (exit 2, bruto preservado, nada enviado): o módulo não inventa cortes de 2 s (ED-3/ED-9).** Plano parado no meio do clipe não derruba a edição: o tempo morto além de `static_max_s` é retirado por concat (ED-4), sem cortar palavra. Depois da edição, o **editado** passa pelo portão de fidelidade (`video_edit.py fidelity --db DB --video-id N --ficha F.json --script S.json [--frames-out D]` extrai os quadros do editado e confere a nota: cor por parte, ação das móveis, trajeto e destino). A nota nunca é gerada pelo worker.
 
 **Transcrição.** `faster-whisper` está em `worker/requirements.txt` (mesmas versões do `install.sh`). Quem instala é o `install.sh`, depois do clique do igaoeu; sem ele a transcrição falha, a edição não roda e nada é enviado. Com fala densa, um plano pode passar da faixa de 1,5–2,5 s (ex.: 2,62 s): o ED-8 (não cortar palavra) prevalece sobre o ED-3 e o aviso fica registrado em `warnings`.
 
 **Dry run (0 crédito, sem Flow, sem painel).**
 
     python3 worker/studio_worker.py --dry-run-edit --workdir /tmp/dry            # gera clipe de fixture com ffmpeg
-    python3 worker/studio_worker.py --dry-run-edit --clip X.mp4 --words X.words.json --workdir /tmp/dry
+    python3 worker/studio_worker.py --dry-run-edit --clip X.mp4 --words X.words.json --cuts cortes.json --workdir /tmp/dry   # --cuts é obrigatório com clipe próprio
 
-Imprime um JSON (`ok`, `credits`=0, `raw_path`, `edited_path`, `duration`, `cuts`, `warnings`) e sai com 0, ou com o código de `video_edit.py` (2, 3, 4, 5, 6, 7) em falha.
+Imprime um JSON (`ok`, `credits`=0, `raw_path`, `edited_path`, `duration`, `cuts`, `warnings`) e sai com 0, ou com o código de `video_edit.py` (2, 3, 4, 5, 6, 7; 8 = resultado fora do schema, com JSON de erro próprio; 9 = fidelidade incompleta) em falha.
 
 ### Login, 2FA ou CAPTCHA
 

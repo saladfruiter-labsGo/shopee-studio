@@ -249,6 +249,7 @@ class ScriptV3Test(unittest.TestCase):
 
 
 # ---------- ED: edição ffmpeg com clipe de fixture ----------
+CUTS = [6.4, 8.5, 10.6]  # cortes que a rotina com visão proporia para o clipe de fixture
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe indisponíveis")
 class EditTest(unittest.TestCase):
     @classmethod
@@ -270,6 +271,7 @@ class EditTest(unittest.TestCase):
 
     def edit(self, **kw):
         kw.setdefault("words", self.words)
+        kw.setdefault("proposed", CUTS)  # ED-3/ED-9: os cortes vêm de fora; o módulo não inventa nenhum
         return ve.edit_clip(self.db, 1, self.work / "out", kw.pop("cfg", None), dry_run=True, **kw)
 
     def test_fixture_is_a_15s_clip_with_audio_and_25_words(self):
@@ -305,8 +307,8 @@ class EditTest(unittest.TestCase):
                         "-pix_fmt", "yuv420p", "-c:a", "aac", str(still)], check=True)
         ve.deliver_raw(self.db, 2, "2:2", still, self.work / "raw")
         with self.assertRaises(ve.EditError) as ctx:
-            ve.edit_clip(self.db, 2, self.work / "out", words=self.words, dry_run=True)
-        self.assertEqual(ctx.exception.code, "static_shot")
+            ve.edit_clip(self.db, 2, self.work / "out", words=self.words, proposed=CUTS, dry_run=True)
+        self.assertIn(ctx.exception.code, ("static_shot", "bad_duration", "too_short"))  # nada é enviado
         self.assertEqual(ve.get_clip(self.db, 2)["status"], "edit_failed")
         self.assertIsNone(ve.get_clip(self.db, 2)["edited_path"])
 
@@ -322,13 +324,15 @@ class EditTest(unittest.TestCase):
         result = self.edit()
         for shot in result["cuts"][1:]:
             self.assertFalse(ve.inside_word(shot["raw_start"], self.words, 0.05 - 1e-6), shot)
-        # o corte nominal (6,75 s) caía na palavra 14: tem de ter deslizado até a pausa dentro de ±0,5 s
-        self.assertTrue(ve.inside_word(0.75 + 6.0, self.words, 0.05))
-        self.assertLessEqual(abs(result["cuts"][0]["raw_end"] - 6.75), 0.5)
+        # corte proposto dentro de uma palavra desliza até a pausa dentro de ±0,5 s
+        inside = next(w for w in self.words if w["start"] + 0.1 < w["end"] - 0.1)["start"] + 0.15
+        moved = self.edit(proposed=[inside + 5, inside + 7])["cuts"][0]["raw_end"]
+        self.assertFalse(ve.inside_word(moved, self.words, 0.05 - 1e-6))
+        self.assertLessEqual(abs(moved - (inside + 5)), 0.5)
 
     def test_ed8_conflict_with_ed3_the_word_wins_and_a_cut_is_dropped(self):
         dense = [dict(word="w", start=0.9 + i * 0.4, end=0.9 + i * 0.4 + 0.38) for i in range(24)]  # sem pausa útil
-        plan = ve.plan_cuts(15.0, dense, ve.config())
+        plan = ve.plan_cuts(15.0, dense, ve.config(), CUTS)
         self.assertTrue(plan["warnings"])
         for cut in plan["cuts"]:
             self.assertFalse(ve.inside_word(cut, dense, 0.05 - 1e-6))
@@ -337,12 +341,12 @@ class EditTest(unittest.TestCase):
         def broken(_):
             raise ve.EditError("transcription_failed", "falhou")
         with self.assertRaises(ve.EditError) as ctx:
-            ve.edit_clip(self.db, 1, self.work / "out", transcriber=broken, dry_run=True)
+            ve.edit_clip(self.db, 1, self.work / "out", proposed=CUTS, transcriber=broken, dry_run=True)
         self.assertEqual(ctx.exception.code, "transcription_failed")
         clip = ve.get_clip(self.db, 1)
         self.assertEqual((clip["status"], clip["edited_path"]), ("edit_failed", None))
         with self.assertRaises(ve.EditError):  # transcrição vazia também não envia
-            ve.edit_clip(self.db, 1, self.work / "out", words=[], dry_run=True)
+            ve.edit_clip(self.db, 1, self.work / "out", words=[], proposed=CUTS, dry_run=True)
 
     def test_ed9_agent_cuts_from_frames_are_snapped_and_used(self):
         frames = ve.extract_frames(self.clip, self.work / "frames")
@@ -389,6 +393,11 @@ class EditTest(unittest.TestCase):
             ve.edit_clip(self.db, 99, self.work / "out", words=self.words)
         self.assertEqual(ctx.exception.code, "raw_missing")
 
+    def cuts_file(self):
+        path = self.work / "cuts.json"
+        path.write_text(json.dumps(dict(cuts=CUTS)))
+        return path
+
     def cli(self, *args):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -401,7 +410,7 @@ class EditTest(unittest.TestCase):
                               "--raw", str(self.clip), "--dest", str(self.work / "raw3"))
         self.assertEqual((code, data["status"]), (0, "raw_delivered"))
         code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"),
-                              "--words", str(self.words_file), "--dry-run")
+                              "--words", str(self.words_file), "--cuts", str(self.cuts_file()), "--dry-run")
         self.assertEqual(code, 0)
         self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
         self.assertTrue(data["ok"] and data["dry_run"] and data["credits"] == 0 and data["error"] is None)
@@ -412,12 +421,68 @@ class EditTest(unittest.TestCase):
         self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
         empty = self.work / "empty.json"
         empty.write_text(json.dumps(dict(words=[])))
-        code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"), "--words", str(empty))
+        code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"), "--words", str(empty),
+                              "--cuts", str(self.cuts_file()))
         self.assertEqual((code, data["error"]["code"], data["status"]), (3, "transcription_failed", "edit_failed"))
         self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
         code, data = self.cli("edit", "--db", db, "--video-id", "3", "--out", str(self.work / "o3"), "--words", "/nao/existe.json")
         self.assertEqual((code, data["ok"]), (2, False))
         self.assertEqual(self.cli("edit", "--db", db)[0] if False else ve.main(["edit", "--db", db]), 2)
+
+    def test_ed3_ed9_without_cuts_the_edit_fails_and_invents_nothing(self):
+        with self.assertRaises(ve.EditError) as ctx:
+            ve.edit_clip(self.db, 1, self.work / "out", words=self.words, dry_run=True)
+        self.assertEqual(ctx.exception.code, "cuts_missing")
+        clip = ve.get_clip(self.db, 1)
+        self.assertEqual((clip["status"], clip["error_code"], clip["edited_path"]), ("edit_failed", "cuts_missing", None))
+        self.assertFalse(hasattr(ve, "nominal_cuts"))
+        code, data = self.cli("edit", "--db", str(self.work / "w.db"), "--video-id", "1", "--out", str(self.work / "o"),
+                              "--words", str(self.words_file), "--dry-run")
+        self.assertEqual((code, data["error"]["code"], data["status"]), (2, "cuts_missing", "edit_failed"))
+        self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
+
+    def test_ed4_static_plan_in_the_middle_is_cut_not_failed(self):
+        mixed = self.work / "mixed.mp4"
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=360x640:rate=25:duration=3.4",
+                        "-f", "lavfi", "-i", "color=c=blue:size=360x640:rate=25:duration=3.0",
+                        "-f", "lavfi", "-i", "testsrc2=size=360x640:rate=25:duration=9",
+                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=15.4",
+                        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]", "-map", "[v]", "-map", "3:a",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(mixed)], check=True)
+        ve.deliver_raw(self.db, 4, "4:4", mixed, self.work / "raw")
+        spans = [0.9 + i * 0.4 for i in range(6)] + [6.7 + i * 0.5 for i in range(8)]  # pausa de fala durante o plano parado (3,4–6,4 s)
+        words = [dict(word="p", start=t, end=t + 0.25) for t in spans]
+        self.assertTrue(ve.static_segments(mixed, 1.5))
+        result = ve.edit_clip(self.db, 4, self.work / "out", words=words, proposed=[6.8, 9.0, 11.0], dry_run=True)
+        self.assertTrue(result["dead_removed"])
+        self.assertEqual(ve.static_segments(result["edited_path"], 1.5), [])
+        self.assertTrue(10 - 0.15 <= result["duration"] <= 12 + 0.15, result["duration"])
+
+    def test_ed14_out_of_schema_result_prints_its_own_error_json(self):
+        original = ve.result_json
+        ve.result_json = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("saída fora do schema: $.credits"))
+        try:
+            code, data = self.cli("edit", "--db", str(self.work / "w.db"), "--video-id", "1", "--out", str(self.work / "o"),
+                                  "--words", str(self.words_file), "--cuts", str(self.cuts_file()), "--dry-run")
+        finally:
+            ve.result_json = original
+        self.assertEqual((code, data["ok"], data["error"]["code"]), (8, False, "invalid_result"))
+        self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
+
+    def test_v3_7_edited_clip_goes_through_the_fidelity_gate(self):
+        ficha = dict(parts=[dict(name="tampa", color="branca", material="plástico", movable=True, opens_how="gira",
+                                 visible_in_photo=True)], does_not_open=["corpo"])
+        script = dict(use_scene=dict(exit="bancada", route="cozinha", destination="geladeira"))
+        self.edit()
+        pending = ve.fidelity_check(self.db, 1, ficha, script, self.work / "ff")
+        self.assertFalse(pending["ok"])
+        self.assertTrue(pending["frames"] and "tampa" in pending["prompt"])
+        note = dict(colors=[dict(part="tampa")], moving_parts=[dict(part="tampa")], route=dict(seen="ok", ok=True),
+                    destination=dict(seen="ok", ok=True), score=8)
+        ve.save_strategy_and_note(self.db, 1, "uso_real_trajeto", note)
+        self.assertEqual(ve.fidelity_check(self.db, 1, ficha, script)["issues"], [])
+        ve.save_strategy_and_note(self.db, 1, "uso_real_trajeto", dict(note, colors=[]))
+        self.assertTrue(ve.fidelity_check(self.db, 1, ficha, script)["issues"])
 
     def test_schema_validator_rejects_bad_output(self):
         good = dict(ok=True, video_id=1, status="edited", raw_path="a", edited_path="b", duration=10.5, cuts=[], warnings=[],
@@ -429,10 +494,13 @@ class EditTest(unittest.TestCase):
 
     def test_edit_params_are_configurable(self):
         for key in ("edit_min_s", "edit_max_s", "hook_end_s", "shot_target_s", "shot_tol_s", "static_max_s",
-                    "word_margin_s", "lead_silence_max_s"):
+                    "word_margin_s", "lead_silence_max_s", "edit_tolerance_s"):
             self.assertEqual(DEFAULTS[key], ve.DEFAULTS[key])
         cfg = ve.config(dict(edit_min_s=10, edit_max_s=11.5))
-        self.assertLessEqual(self.edit(cfg=cfg)["duration"], 11.5 + 0.15)
+        self.assertLessEqual(self.edit(cfg=cfg)["duration"], 11.5 + cfg["edit_tolerance_s"])
+        self.assertEqual(ve.config(dict(edit_tolerance_s=0.4))["edit_tolerance_s"], 0.4)  # ED-1: parâmetro, não literal
+        with self.assertRaises(ValueError):
+            validate_settings(dict(edit_tolerance_s=9))
         with self.assertRaises(ValueError):
             validate_settings(dict(edit_min_s=13.0))
 
@@ -467,7 +535,7 @@ class WorkerFlowTest(unittest.TestCase):
     def test_raw_is_delivered_before_the_edit_and_note_is_saved(self):
         stages = []
         result = self.sw.process_v3_clip(
-            self.config, 7, self.clip, dict(product_key="9:9", strategy="problema_real", fidelity_note=dict(score=8)),
+            self.config, 7, self.clip, dict(product_key="9:9", strategy="problema_real", fidelity_note=dict(score=8), cuts=CUTS),
             stage=lambda name, **kw: stages.append(name), words=ve.load_words(self.words_file), dry_run=True)
         row = self.row()
         self.assertEqual(stages, ["editing"])
@@ -478,7 +546,7 @@ class WorkerFlowTest(unittest.TestCase):
 
     def test_transcription_failure_keeps_raw_and_sends_nothing(self):  # ED-8 + ED-11, sem faster-whisper neste host
         with self.assertRaises(self.sw.VideoError) as caught:
-            self.sw.process_v3_clip(self.config, 7, self.clip, dict(product_key="9:9"), words=None, dry_run=True)
+            self.sw.process_v3_clip(self.config, 7, self.clip, dict(product_key="9:9", cuts=CUTS), words=None, dry_run=True)
         self.assertEqual((caught.exception.code, caught.exception.edit_code, caught.exception.charged),
                          ("edit_failed", "transcription_failed", True))
         row = self.row()
@@ -524,7 +592,7 @@ class WorkerFlowTest(unittest.TestCase):
         ve.whisper_words = lambda raw, model="small": words  # o dry_run usa o JSON de palavras do fixture
         try:
             task = dict(id=7, payload=dict(project_url="u", prompt="p", expected_cost=60, model="m",
-                                           edit=dict(product_key="9:9", strategy="problema_real")))
+                                           edit=dict(product_key="9:9", strategy="problema_real", cuts=CUTS)))
             meta = sw.run_video(self.config, task, "w")
         finally:
             ve.whisper_words = original_whisper
@@ -541,8 +609,10 @@ class WorkerFlowTest(unittest.TestCase):
     def test_cli_dry_run_covers_the_whole_flow_with_zero_credit(self):
         out = io.StringIO()
         with redirect_stdout(out):
+            cuts = self.work / "cuts.json"
+            cuts.write_text(json.dumps(dict(cuts=CUTS)))
             code = self.sw.dry_run_edit(["--clip", str(self.clip), "--words", str(self.words_file),
-                                         "--workdir", str(self.work / "cli")])
+                                         "--cuts", str(cuts), "--workdir", str(self.work / "cli")])
         data = json.loads(out.getvalue())
         self.assertEqual((code, data["ok"], data["credits"], data["dry_run"]), (0, True, 0, True))
         self.assertTrue(Path(data["raw_path"]).is_file() and Path(data["edited_path"]).is_file())
