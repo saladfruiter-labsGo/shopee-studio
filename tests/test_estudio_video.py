@@ -349,7 +349,7 @@ class StudioVideoTest(unittest.TestCase):
         long_narration = ("Suportar poeira de reforma tira qualquer um do sério. O revestimento vinílico adesivo renova a sala "
                           "sem sujeira e sem esforço nenhum, no mesmo dia. Evite esse transtorno: toque no produto marcado.")
         long = self.post(f"/studio/{sid}/scripts/0", dict(script=dict(narration=long_narration))).json["scripts"][0]
-        self.assertIn("narração com 29 palavras; use de 22 a 28", long["problems"])
+        self.assertIn("narração com 32 palavras; use de 22 a 28", long["problems"])
         short = self.post(f"/studio/{sid}/scripts/0", dict(script=dict(narration="Cansado de bagunça na cozinha? Este pote fecha "
                                                                        "com um clique e mantém tudo fresco por muito mais tempo. Toque no produto marcado."))).json
         self.assertEqual(short["scripts"][0]["problems"], [])
