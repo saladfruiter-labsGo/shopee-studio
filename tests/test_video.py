@@ -150,6 +150,16 @@ class VideoTest(unittest.TestCase):
         self.assertIn("Mantém os alimentos frescos", self.sent[0][1]["caption"])
         self.assertNotIn("alterado", self.sent[0][1]["caption"])
 
+    def test_default_budget_is_zero_and_refuses_every_real_generation(self):
+        """Padrão v3: video_daily_credits = 0 (config) recusa toda geração real; nenhum crédito é reservado."""
+        from core import DEFAULTS
+        self.assertEqual((DEFAULTS["video_daily_credits"], DEFAULTS["video_cost"]), (0, 60))
+        self.store.save_settings(dict(video_daily_credits=0, video_cost=60))
+        self.deliver()
+        self.assertEqual([(v["state"], v["credits"]) for v in self.videos()], [("skipped", 0)] * 3)
+        self.assertTrue(all("teto diário de 0 créditos" in v["error"] for v in self.videos()))
+        self.assertEqual(self.sent, [])
+
     def test_cap_disabled_and_missing_project_leave_products_failed_without_messages(self):
         self.store.save_settings(dict(video_daily_credits=20))
         run_id = self.deliver()

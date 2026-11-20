@@ -10,6 +10,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from flow_steps import StepError, check_cost, domain_ok, label_allowed
+
 CHROME = Path.home() / ".cache" / "ms-playwright" / "chromium-1234" / "chrome-linux64" / "chrome"
 PROMPT_BOX = 'div[role="textbox"][contenteditable="true"]'
 PROMPT_BOX_VISIBLE = PROMPT_BOX + ":visible"
@@ -136,6 +138,8 @@ class Flow:
 
     def click_label(self, label, last=True, timeout=10):
         """Click a button by aria-label through the DOM (hover-only controls report as not visible)."""
+        if not label_allowed(label):  # Lista fechada de botões: "Sempre aprovar" e qualquer outro não listado nunca são clicados.
+            raise FlowError("ui_changed", f"Clique recusado: '{label}' não está na lista de botões permitidos.")
         deadline = time.time() + timeout
         while time.time() < deadline:
             done = self.page.evaluate("""([label, last]) => {
@@ -157,7 +161,7 @@ class Flow:
 
     # ---------- steps ----------
     def open_project(self, url):
-        if not re.match(r"^https://(flow\.google\.com|labs\.google)/", url or ""):
+        if not domain_ok(url):
             raise FlowError("no_project", "Configure a URL do projeto do Flow nas Preferências.")
         self.project_url = url
         self.page.goto(url, wait_until="domcontentloaded", timeout=90000)
@@ -176,7 +180,7 @@ class Flow:
         opened = self.page.evaluate("""() => {
             const panes = [...document.querySelectorAll('.cdk-overlay-container .cdk-overlay-pane')];
             if (panes.some(p => p.offsetParent !== null && [...p.querySelectorAll('button[role=radio]')]
-                    .some(b => /^(360p|720p|4s|6s|8s|10s)$/.test(b.innerText.trim())))) return 'aberto';
+                    .some(b => /^(360p|720p|4s|6s|8s|10s|15s)$/.test(b.innerText.trim())))) return 'aberto';
             const button = [...document.querySelectorAll('button')]
                 .find(b => b.getAttribute('aria-label') === 'Gatilho de configurações'
                         && b.closest('flow-base-prompt-box'));
@@ -194,7 +198,7 @@ class Flow:
                 const panes = [...document.querySelectorAll('.cdk-overlay-container .cdk-overlay-pane')]
                     .filter(p => p.offsetParent !== null);
                 return panes.find(p => [...p.querySelectorAll('button[role=radio]')]
-                    .some(b => /^(360p|720p|4s|6s|8s|10s)$/.test(b.innerText.trim()))) || null; }""")
+                    .some(b => /^(360p|720p|4s|6s|8s|10s|15s)$/.test(b.innerText.trim()))) || null; }""")
             pane = handle.as_element()
             if pane:
                 return pane
@@ -244,8 +248,8 @@ class Flow:
             time.sleep(3)
         raise FlowError("ui_changed", "Não consegui desligar o modo Agente do Flow; sem isso não há chave de vídeo.")
 
-    def ensure_settings(self, model, expected_cost=None):
-        """Agente desligado + compositor em Vídeo, Elementos, 9:16, 720p, 10 s, x1 e modelo esperado.
+    def ensure_settings(self, model, expected_cost=None, duration="15s"):
+        """Agente desligado + compositor em Vídeo, Elementos, 9:16, 720p, 15 s (padrão v3), x1 e modelo esperado.
 
         Devolve o custo que o Flow mostra para a geração. Com o Agente desligado não existe cartão
         de confirmação: os créditos saem no envio, então quem chama avisa o painel antes.
@@ -258,7 +262,7 @@ class Flow:
             raise FlowError("ui_changed", "O painel do compositor não oferece a opção Vídeo "
                                           "(modo Agente ainda ativo?).")
         # Elementos: as imagens anexadas são referências do produto (em Frames, 2 imagens viram quadro inicial/final).
-        for label in ("Vídeo", "Elementos", "9:16", "720p", "10s", "x1"):
+        for label in ("Vídeo", "Elementos", "9:16", "720p", duration, "x1"):
             self.pick(pane, label)
         state = pane.evaluate("""(pane) => ({
             modelo: (pane.querySelector('button[aria-label="Selecionar família de modelos"]')?.innerText || '')
@@ -273,9 +277,11 @@ class Flow:
         cost = COST_PANEL.search(state["text"])
         if not cost:
             raise FlowError("ui_changed", "O Flow não mostrou o custo da geração no compositor.")
-        if expected_cost is not None and int(cost.group(1)) != int(expected_cost):
-            raise FlowError("cost_mismatch", f"O compositor do Flow estima {cost.group(1)} créditos; o esperado era "
-                                             f"{expected_cost}. Nada foi gerado.")
+        if expected_cost is not None:
+            try:
+                check_cost(int(cost.group(1)), expected_cost)  # custo esperado vem da configuração, sem valor fixo
+            except StepError as error:
+                raise FlowError(error.code, str(error)) from None
         self.page.keyboard.press("Escape")  # O painel salva conforme muda; fechar libera a caixa de comando.
         time.sleep(1)
         return int(cost.group(1))
@@ -446,6 +452,8 @@ class Flow:
     def answer(self, approve):
         """Pick exactly "Aprovar" or "Rejeitar" (never "Sempre aprovar": it would disable the cost check)."""
         label = "Aprovar" if approve else "Rejeitar"
+        if not label_allowed(label):
+            raise FlowError("ui_changed", f"Clique recusado: '{label}' não está na lista de botões permitidos.")
         option = self.page.locator(f'flow-permission-message [role="radio"][aria-label="{label}"][aria-disabled="false"]').last
         if not option.count():
             raise FlowError("ui_changed", f"Opção {label} não encontrada no cartão de confirmação.")
@@ -544,7 +552,7 @@ class Flow:
         before = self.counts()
         refs = ("a imagem anexada como referência do produto" if len(images) == 1 else
                 f"as {len(images)} imagens anexadas como referência do mesmo produto")
-        command = (f"Gere agora exatamente 1 vídeo com o modelo {model}, proporção 9:16, 10 segundos, usando "
+        command = (f"Gere agora exatamente 1 vídeo com o modelo {model}, proporção 9:16, 15 segundos, usando "
                    f"{refs}. Não faça perguntas. {prompt}")
         if dry_run:
             self.log(f"Flow: dry_run; nada enviado ({cost} créditos seriam gastos).")
