@@ -331,9 +331,9 @@ class StudioVideoTest(unittest.TestCase):
         self.assertIn("0–3 s, problema e câmera:", draft["prompt"])
         self.assertIn("8–10 s, respiro final (sem fala, produto inteiro e câmera parada)", draft["prompt"])
         self.assertIn("A fala termina antes do fim", draft["prompt"])
-        self.assertEqual(draft["narration_words"], [14, 19])
-        self.assertTrue(all(14 <= s["words"] <= 19 for s in draft["scripts"]), [s["words"] for s in draft["scripts"]])
-        self.assertIn("de 14 a 19 palavras", prompt)
+        self.assertEqual(draft["narration_words"], [22, 28])
+        self.assertTrue(all(22 <= s["words"] <= 28 for s in draft["scripts"]), [s["words"] for s in draft["scripts"]])
+        self.assertIn("de 22 a 28 palavras", prompt)
         self.assertIn("a faixa de cima fica livre", draft["prompt"])
         self.assertIn("Sem textos, legendas", draft["prompt"])  # the callouts are burned later, never drawn by the AI
         self.assertEqual(self.generate(sid).status_code, 202)
@@ -344,23 +344,23 @@ class StudioVideoTest(unittest.TestCase):
         self.assertNotIn("badge", finish)  # fim limpo: sem "★ nota • N vendidos" e sem "CONFIRA NO PRODUTO MARCADO"
 
     def test_problem_style_keeps_two_seconds_of_breath(self):
-        """A fala tem de terminar antes do fim: 23 palavras (as duas que saíram cortadas em 12/11) são recusadas."""
+        """A fala tem de terminar antes do fim: acima da faixa v3 (22–28 palavras) é recusada."""
         sid = self.draft(style="problema")
-        long_narration = ("Suportar poeira de reforma tira qualquer um do sério. O revestimento vinílico adesivo renova "
-                          "sem sujeira. Evite esse transtorno: toque no produto marcado.")
+        long_narration = ("Suportar poeira de reforma tira qualquer um do sério. O revestimento vinílico adesivo renova a sala "
+                          "sem sujeira e sem esforço nenhum, no mesmo dia. Evite esse transtorno: toque no produto marcado.")
         long = self.post(f"/studio/{sid}/scripts/0", dict(script=dict(narration=long_narration))).json["scripts"][0]
-        self.assertIn("narração com 23 palavras; use de 14 a 19", long["problems"])
+        self.assertIn("narração com 29 palavras; use de 22 a 28", long["problems"])
         short = self.post(f"/studio/{sid}/scripts/0", dict(script=dict(narration="Cansado de bagunça na cozinha? Este pote fecha "
-                                                                       "com um clique. Toque no produto marcado."))).json
+                                                                       "com um clique e mantém tudo fresco por muito mais tempo. Toque no produto marcado."))).json
         self.assertEqual(short["scripts"][0]["problems"], [])
-        self.assertEqual(self.get(sid)["narration_words"], [14, 19])
+        self.assertEqual(self.get(sid)["narration_words"], [22, 28])
 
     def test_classic_style_is_unchanged(self):
         self.connect_worker()
         sid = self.draft()
         draft = self.get(sid)
         self.assertEqual(draft["scripts_style"], "classico")
-        self.assertEqual(draft["narration_words"], [18, 25])
+        self.assertEqual(draft["narration_words"], [22, 28])
         self.assertNotIn("callouts", draft["scripts"][0])
         self.assertIn("0–2 s, gancho:", draft["prompt"])
         self.generate(sid)

@@ -192,6 +192,7 @@ class RoundsTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = Store(self.temp.name)
+        self.store.save_settings(dict(video_daily_credits=75, video_cost=15))  # teste: orçamento explícito (padrão v3: teto 0, custo 60)
         self.pages = {(0, 1): ([offer(i) for i in range(10, 30)], True), (0, 2): ([offer(i) for i in range(30, 50)], False)}
         self.search = FakeSearch(self.pages)
         self.engine = Engine(self.store, fetcher=lambda _: [], searcher=self.search, runner=ScriptedRunner())
