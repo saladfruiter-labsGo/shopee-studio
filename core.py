@@ -49,7 +49,8 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 # video_daily_credits = 0 recusa toda geração real até o igaoeu definir o teto.
                 script_words_target=25, script_words_tol=3,
                 edit_min_s=10.0, edit_max_s=12.0, hook_end_s=6.0, shot_target_s=2.0, shot_tol_s=0.5,
-                static_max_s=1.5, word_margin_s=0.05, lead_silence_max_s=0.3)
+                static_max_s=1.5, word_margin_s=0.05, lead_silence_max_s=0.3,
+                edit_tolerance_s=0.15)  # ED-1: folga de duração do editado em relação a edit_min_s/edit_max_s
 MODES = {"legacy", "modern"}
 DECISIONS = {"new", "planned", "published", "discarded"}
 API = "https://open-api.affiliate.shopee.com.br/graphql"
@@ -164,7 +165,7 @@ def validate_settings(payload, existing=None):
     for key in ("edit_min_s", "edit_max_s", "hook_end_s", "shot_target_s", "shot_tol_s", "static_max_s"):
         if not 0 < result[key] <= 60:
             raise ValueError(f"{key}: use um valor entre 0 e 60 segundos.")
-    for key in ("word_margin_s", "lead_silence_max_s"):
+    for key in ("word_margin_s", "lead_silence_max_s", "edit_tolerance_s"):
         if not 0 <= result[key] <= 5:
             raise ValueError(f"{key}: use um valor entre 0 e 5 segundos.")
     if result["edit_min_s"] > result["edit_max_s"]:
@@ -1123,8 +1124,8 @@ class Engine:
         round_started = self.clock()
         try:
             output, provider, attempts = self.runner.run(
-                analysis.build_prompt(product, batch, creative), analysis.SCHEMA, analysis.images_for(product, batch),
-                analysis.make_check(batch, product, creative), log=log, deadline=deadline)
+                analysis.build_prompt(product, batch, creative, settings), analysis.SCHEMA, analysis.images_for(product, batch),
+                analysis.make_check(batch, product, creative, settings), log=log, deadline=deadline)
         except ModelError as error:
             self.store.log("error", f"{product['name'][:60]}: {safe_error(error)}")
             result = analysis.fallback(product, batch, safe_error(error)[:400], [], notes, creative)

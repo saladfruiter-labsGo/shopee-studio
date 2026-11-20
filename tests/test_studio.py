@@ -9,6 +9,10 @@ from core import DEFAULTS, Engine, Store, TZ, fetch_offers, fetch_product_page, 
 from app import create_app
 
 
+NARRATION = ("Pote que vaza estraga a comida, né? Esse fecha com um clique, segura tudo fresco e cabe na geladeira "
+             "sem ocupar espaço nenhum. Toque no produto marcado.")
+
+
 def good_output(count=0, verdicts=None):
     verdicts = verdicts or {}
     return dict(equivalents=[dict(id=f"C{i}", verdict=verdicts.get(i, "incompatible"), reason="motivo")
@@ -17,7 +21,13 @@ def good_output(count=0, verdicts=None):
                 hashtags=["#PoteHermetico", "#CozinhaOrganizada"],
                 hook="Close do pote sendo fechado com um clique", demo="Mão enche o pote e fecha a tampa",
                 benefit="Alimentos frescos por mais tempo", cta="Pessoa aponta para o produto do vídeo",
-                narration="Olha que prático: fecha com um clique e mantém tudo fresco. Toque no produto do vídeo.")
+                narration=NARRATION,
+                ficha=dict(parts=[dict(name="tampa", color="branca", material="plástico", movable=True,
+                                       opens_how="gira para a esquerda", visible_in_photo=True),
+                                  dict(name="corpo", color="transparente", material="plástico", movable=False,
+                                       visible_in_photo=True)], does_not_open=["corpo"]),
+                use_scene=dict(exit="da bancada", route="pela cozinha até a geladeira", destination="na prateleira da geladeira",
+                               actions=[dict(part="tampa", action="gira para fechar")]))
 
 
 class FakeRunner:

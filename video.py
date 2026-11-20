@@ -46,6 +46,10 @@ def today(tz):
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 
+EDIT_KEYS = ("edit_min_s", "edit_max_s", "hook_end_s", "shot_target_s", "shot_tol_s", "static_max_s", "word_margin_s",
+             "lead_silence_max_s", "edit_tolerance_s")
+
+
 class Videos:
     def __init__(self, engine, tz):
         self.engine, self.store, self.tz = engine, engine.store, tz
@@ -165,6 +169,12 @@ class Videos:
         if product.get("mode") == "modern":
             # The product keeps the mode it was chosen with; older workers simply ignore this key.
             payload["finish"] = dict(size=[1080, 1920], badge=badge(product), frames=True)
+        if analysis.get("v3"):
+            # Padrão v3: ficha e cena de uso seguem com a tarefa; o worker entrega o bruto e edita só com corte (sem selo
+            # nem legenda, ED-6; `finish` só serve aos quadros da fidelidade). Os cortes e a nota de fidelidade vêm da rotina do agente (--cuts), não daqui.
+            payload["edit"] = dict(product_key=str(product.get("key") or video_id), ficha=analysis.get("ficha"),
+                                   use_scene=analysis.get("use_scene"),
+                                   config={k: settings[k] for k in EDIT_KEYS if k in settings})
         task_id = self.store.create_task("video", payload, deadline=VIDEO_TASK_SECONDS)
         with self.store.db() as db:
             db.execute("UPDATE videos SET task_id=?,attempts=attempts+1,state='queued' WHERE id=?", (task_id, video_id))

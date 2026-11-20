@@ -110,8 +110,8 @@ def video_prompt_v3(script, ficha, seconds=VIDEO_SECONDS):
         f"Velocidade: {SPEED}.",
         f"Cerca de {TRAVEL_SECONDS} s de trajeto em movimento e no máximo ~{MAX_STILL_SECONDS} s parado no final.",
         "Placas, letreiros e fachadas aparecem sem texto escrito (formas e cores, nenhuma letra).",
-        f"Fala em português do Brasil, voz natural e animada: \"{script['narration'].strip()}\" — termina por volta "
-        "de 10–13 s; os últimos ~2 s ficam sem fala, só som ambiente.",
+        f"Fala em português do Brasil, voz natural e animada: \"{script['narration'].strip()}\" — termina até ~11 s "
+        "(a edição fica em 10–12 s); o resto do clipe fica sem fala, só som ambiente.",
         "Sem textos, legendas, banners, logotipos ou marcas d'água na imagem. Sem preços, descontos ou promessas.",
     ])
 

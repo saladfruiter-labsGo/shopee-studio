@@ -6,7 +6,8 @@ import time
 from content import (CAPTION_LIMIT, CLOSING, FORMATS, MAX_LINKS, MODERN_NARRATION_WORDS, NARRATION_MAX_WORDS,
                      STOPWORDS, VIDEO_SECONDS, caption_text, clean_name, copy_problems, fallback_copy, fallback_script,
                      modern_fallback_script, modern_script_problems, name_tokens, script_problems, strip_accents,
-                     text_length, video_prompt)
+                     band_from_settings, text_length, video_prompt)
+from v3 import FICHA_SCHEMA, ficha_issues, script_v3_issues, video_prompt_v3
 
 VERDICTS = {"match", "uncertain", "incompatible"}
 SCHEMA = {
@@ -19,8 +20,15 @@ SCHEMA = {
         "hashtags": {"type": "array", "items": {"type": "string"}},
         "hook": {"type": "string"}, "demo": {"type": "string"}, "benefit": {"type": "string"},
         "cta": {"type": "string"}, "narration": {"type": "string"},
+        # Padrão v3 (issue #14): ficha por parte e cena de uso com saída, trajeto e destino.
+        "ficha": FICHA_SCHEMA,
+        "use_scene": {"type": "object", "required": ["exit", "route", "destination"], "properties": {
+            "exit": {"type": "string"}, "route": {"type": "string"}, "destination": {"type": "string"},
+            "actions": {"type": "array", "items": {"type": "object", "properties": {
+                "part": {"type": "string"}, "action": {"type": "string"}}}}}},
     },
-    "required": ["equivalents", "description", "hashtags", "hook", "demo", "benefit", "cta", "narration"],
+    "required": ["equivalents", "description", "hashtags", "hook", "demo", "benefit", "cta", "narration",
+                 "ficha", "use_scene"],
 }
 
 
@@ -361,7 +369,8 @@ REGRAS DO MODO MODERNO PARA O ROTEIRO:
 """
 
 
-def build_prompt(product, candidates, creative=None):
+def build_prompt(product, candidates, creative=None, settings=None):
+    words = band_from_settings(settings or {})
     return f"""Você analisa anúncios da Shopee e escreve roteiros de vídeos curtos de venda.
 {DATA_RULES}
 
@@ -375,11 +384,17 @@ uso/contexto e uma terceira só se for útil. Proibido: #Shopee, #Achadinhos, #V
 A legenda final é description + espaço + hashtags separadas por espaço e deve ter no máximo {CAPTION_LIMIT} caracteres
 contando tudo. Reescreva para caber; nunca corte palavras nem use reticências.
 
-TAREFA 3 — ROTEIRO DE {VIDEO_SECONDS} SEGUNDOS para um gerador de vídeo que recebe a imagem P como referência.
-"hook" (0–2 s), "demo" (2–6 s, demonstração observável), "benefit" (6–8 s), "cta" (8–10 s, gesto ou cena que convide
-a tocar no produto do vídeo). Descreva só cenas filmáveis, em português, até 220 caracteres cada. O vídeo não terá
-textos, ícones, setas nem elementos gráficos na tela: a legenda é aplicada depois.
-"narration": a fala completa em português do Brasil, até {NARRATION_MAX_WORDS} palavras, natural para {VIDEO_SECONDS} s.
+TAREFA 3 — FICHA E ROTEIRO DE {VIDEO_SECONDS} SEGUNDOS (padrão v3) para um gerador de vídeo que recebe a imagem P
+como referência. O clipe é UM só, de {VIDEO_SECONDS} s, com vários planos e a voz nativa do gerador.
+"ficha": só o que a foto mostra. Em "parts", cada parte do produto com "name", "color", "material", "movable"
+(true só se abre ou se mexe), "opens_how" (obrigatório nas partes móveis: a direção do movimento) e "visible_in_photo".
+Em "does_not_open", liste o que NÃO abre nem se mexe (mesmo que seja só o corpo principal).
+"hook", "demo", "benefit", "cta": cenas filmáveis em português, até 220 caracteres cada, em ordem: selfie com fala
+(gancho), detalhe da parte que vende, uso em plano aberto, POV do comando, close final. Sem textos, ícones, setas ou
+elementos gráficos na tela. Só mostre ação em parte móvel da ficha que apareça na foto.
+"use_scene": "exit" (de onde sai), "route" (por onde passa, em movimento) e "destination" (onde chega).
+"narration": a fala completa em português do Brasil, de {words[0]} a {words[1]} palavras, terminando por volta de
+11 s; a última frase cita "{CLOSING}". Não comece com "Olha" nem "Gente".
 Preserve a aparência do produto. Não invente atributos, acessórios, resultados, descontos, escassez ou depoimentos.
 {creative_rules(creative)}
 Responda somente com o JSON do schema."""
@@ -411,15 +426,23 @@ def _equivalent_problems(output):
     return []
 
 
-def make_check(candidates, product=None, creative=None):
-    """`creative` (Modern mode) adds the hands-only, closing, opening and number rules."""
+def make_check(candidates, product=None, creative=None, settings=None):
+    """Portão do roteirista v3: legenda + ficha por parte + roteiro com trajeto (`v3.script_v3_issues`), com a faixa de
+    palavras da configuração. `creative` (modo Moderno) soma as regras de só-mãos e de aberturas."""
+    words = band_from_settings(settings or {})
+    name = (product or {}).get("name", "")
+
     def check(output):
         if not isinstance(output, dict):
             return ["resposta não é um objeto JSON"]
         problems = copy_problems(output.get("description"), output.get("hashtags"))
-        problems += script_problems(output)
+        ficha = output.get("ficha")
+        problems += ficha_issues(ficha)
+        problems += script_v3_issues(output, ficha if isinstance(ficha, dict) else {}, name,
+                                     (creative or {}).get("openings") or (), words=words)
         if creative:
-            problems += modern_script_problems(output, product["name"], creative.get("openings") or ())
+            problems += [p for p in modern_script_problems(output, name, creative.get("openings") or ())
+                         if "narração com" not in p]
         return problems + _equivalent_problems(output)
     return check
 
@@ -460,11 +483,14 @@ def finalize(product, candidates, output, provider, attempts, notes, creative=No
     reviewed = review(product, candidates, output, 1)
     description, hashtags = output["description"].strip(), [t.strip() for t in output["hashtags"]]
     script = {k: output[k].strip() for k in ("hook", "demo", "benefit", "cta", "narration")}
+    script["use_scene"] = output["use_scene"]
+    ficha = output["ficha"]
     caption = caption_text(description, hashtags)
-    prompt = video_prompt(script, True, creative["format"]) if creative else video_prompt(script)
+    prompt = video_prompt_v3(script, ficha)  # padrão v3: um clipe de 15 s, vários planos, sem texto na imagem
     return dict(status="ok", provider=provider, attempts=attempts, notes=notes,
                 description=description, hashtags=hashtags, caption=caption, caption_length=text_length(caption),
-                script=script, prompt=prompt, narration=script["narration"],
+                script=script, ficha=ficha, use_scene=output["use_scene"], v3=True, prompt=prompt,
+                narration=script["narration"],
                 equivalents=reviewed, links=links_for(product, reviewed), **_modern_fields(creative))
 
 
