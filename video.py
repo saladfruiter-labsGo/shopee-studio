@@ -23,21 +23,26 @@ FIDELITY_SECONDS = 360
 FIDELITY_SCHEMA = {"type": "object", "properties": {"score": {"type": "integer"}, "reason": {"type": "string"}},
                    "required": ["score", "reason"]}
 # Stages reported by the worker, in order. From "approving" on, credits may have been spent.
-STAGES = ["working", "preparing", "approving", "submitted", "downloading", "subtitling", "uploading"]
-CHARGED = {"approving", "submitted", "downloading", "subtitling", "uploading"}
+STAGES = ["working", "preparing", "approving", "submitted", "downloading", "editing", "subtitling", "uploading"]
+CHARGED = {"approving", "submitted", "downloading", "editing", "subtitling", "uploading"}
 ACTIVE = {"queued", *STAGES}
 # A product with a job in one of these states does not get another automatic job.
 # "review" = Estúdio: the video is ready and waits for the user to approve the preview (E4); never sent alone.
-BLOCKING = ACTIVE | {"rendered", "review", "sending", "sent", "delivery_unknown", "delivery_failed", "unknown"}
+# Padrão v3: "awaiting_cuts" espera a rotina do agente de visão; "edit_failed" e "fidelity_rejected" já gastaram crédito.
+V3_WAITING = {"awaiting_cuts", "edit_failed", "fidelity_rejected"}
+BLOCKING = ACTIVE | V3_WAITING | {"rendered", "review", "sending", "sent", "delivery_unknown", "delivery_failed", "unknown"}
 LABELS = {"queued": "na fila", "working": "worker iniciou", "preparing": "preparando no Flow",
           "approving": "aprovando custo", "submitted": "gerando no Flow", "downloading": "baixando",
-          "subtitling": "legendando", "uploading": "enviando ao painel", "rendered": "pronto para enviar",
+          "subtitling": "legendando", "uploading": "enviando ao painel", "editing": "editando",
+          "awaiting_cuts": "aguardando_cortes (nada enviado)", "edit_failed": "falha na edição, nada enviado",
+          "fidelity_rejected": "reprovado na fidelidade, nada enviado", "rendered": "pronto para enviar",
           "review": "pronto, aguardando sua aprovação", "sending": "enviando ao Telegram", "sent": "enviado",
           "delivery_unknown": "entrega não confirmada", "delivery_failed": "envio ao Telegram falhou",
           "failed": "falhou (sem custo)", "unknown": "incerto (créditos podem ter sido gastos)",
           "skipped": "não gerado", "discarded": "descartado por você"}
 # Product delivery state that mirrors each job state (single-message flow only).
-DELIVERY = {**{state: "pending" for state in ACTIVE}, "rendered": "pending", "review": "pending", "sending": "sending",
+DELIVERY = {**{state: "pending" for state in ACTIVE}, "awaiting_cuts": "pending", "edit_failed": "failed",
+            "fidelity_rejected": "failed", "rendered": "pending", "review": "pending", "sending": "sending",
             "sent": "sent", "delivery_unknown": "unknown", "delivery_failed": "refused", "failed": "failed",
             "unknown": "failed", "skipped": "failed", "discarded": "failed"}
 
@@ -140,6 +145,8 @@ class Videos:
                 reason = "URL do projeto do Flow não configurada"
             elif not product.get("image"):
                 reason = "anúncio sem imagem de referência"
+            elif not analysis.get("v3"):
+                reason = "roteiro v3 indisponível"  # fallback do modelo ou corte do Estúdio: sem v3 não há vídeo nem crédito
             elif not budget_allows(settings, self.used_today())[0]:
                 reason = budget_allows(settings, self.used_today())[1]
             now = datetime.now(self.tz).isoformat()
@@ -202,6 +209,8 @@ class Videos:
         Refusals raise and create no row, so a refused click never counts as "generation sent" for the cutoff
         fallback (E10). 'Do dia' counts in the daily cap (E8); 'manual' stays out of it (E11). The finished video
         waits in "review" until the user approves the preview (E4)."""
+        from studio import refuse_studio
+        refuse_studio()
         settings = self.store.settings()
         cost = settings["video_clip_cost_expected"]
         with self.lock:
@@ -272,6 +281,8 @@ class Videos:
                               "unknown": f"Geração incerta; créditos podem ter sido gastos. Confira o Flow antes de gerar "
                                          f"de novo. {error}",
                               "skipped": f"Vídeo não gerado: {error}.",
+                              "edit_failed": f"Falha na edição, nada enviado: {error}",
+                              "fidelity_rejected": f"Reprovado na fidelidade, nada enviado: {error}",
                               "discarded": "Vídeo descartado na prévia do Estúdio; gere outro por lá."}.get(row["state"]),
                    "refused": f"Telegram recusou o vídeo ({error}). O arquivo foi guardado: use Reenviar vídeo.",
                    "unknown": "Entrega não confirmada; confira o Telegram. Não haverá reenvio automático."}.get(state)
@@ -321,6 +332,18 @@ class Videos:
 
     def finish(self, task_id, ok, output, code="", error="", charged=False):
         video = self.by_task(task_id)
+        payload = self.store.task(task_id)["payload"]
+        if ok and isinstance(output, dict) and output.get("awaiting_cuts"):
+            # Etapa 1 do padrão v3: bruto guardado no worker, nada enviado. Os cortes vêm da rotina do agente.
+            self.update(video["id"], state="awaiting_cuts", meta=json.dumps(output)[:4000], error=None)
+            self.sync(video["id"])
+            self.store.log("info", f"Vídeo #{video['id']}: bruto guardado, aguardando_cortes da rotina do agente.")
+            return
+        if ok and payload.get("edit_stage") and not (isinstance(output, dict) and output.get("fidelity_ok") is True):
+            # Defesa em profundidade (V3-7): sem a conferência de fidelidade aprovada nada é enviado.
+            self.update(video["id"], state="fidelity_rejected", error="sem conferência de fidelidade aprovada")
+            self.sync(video["id"])
+            return
         if ok:
             if not video["file"]:
                 self.update(video["id"], state="unknown", error="Worker concluiu sem enviar o arquivo.")
@@ -335,6 +358,12 @@ class Videos:
             threading.Thread(target=self.after_render, args=(video["id"],), daemon=True).start()
             return
         message = str(error or "falha sem detalhe")[:400]
+        if code in ("edit_failed", "fidelity_failed"):  # crédito já gasto, mas o motivo é conhecido: não é "incerto"
+            state = "fidelity_rejected" if code == "fidelity_failed" else "edit_failed"
+            self.update(video["id"], state=state, error=message)
+            self.sync(video["id"])
+            self.store.log("error", f"Vídeo #{video['id']}: {self.LABELS_V3[state]}: {message}")
+            return
         spent = charged or video["state"] in CHARGED
         if code in RETRY_CODES and not spent and video["attempts"] < MAX_ATTEMPTS:
             self.update(video["id"], error=message)
@@ -355,6 +384,58 @@ class Videos:
         self.store.log("error", f"Vídeo #{video['id']} {'incerto' if spent else 'falhou'}: {message}")
         if code in PAUSE_CODES:
             self.pause(code, message)
+
+    LABELS_V3 = {"edit_failed": "falha na edição, nada enviado", "fidelity_rejected": "reprovado na fidelidade, nada enviado"}
+
+    # ---------- padrão v3: etapa 2 (cortes da rotina do agente) ----------
+    def clip_info(self, video_id):
+        """O que a rotina do agente com visão precisa para escolher os cortes."""
+        video = self.get(video_id)
+        edit = {}
+        if video.get("task_id"):
+            edit = self.store.task(video["task_id"])["payload"].get("edit") or {}
+        return dict(video_id=video_id, state=video["state"], label=video["label"], error=video.get("error"),
+                    meta=video["meta"], ficha=edit.get("ficha"), use_scene=edit.get("use_scene"))
+
+    def submit_cuts(self, video_id, cuts, fidelity_note, strategy=None):
+        """A rotina do agente manda cortes + nota de fidelidade + estratégia; só então o worker edita, confere e envia."""
+        if (not isinstance(cuts, list) or not 1 <= len(cuts) <= 12 or
+                not all(isinstance(c, (int, float)) and not isinstance(c, bool) and 0 < c < 60 for c in cuts) or
+                cuts != sorted(cuts)):
+            raise ValueError("cuts deve ser uma lista crescente de 1 a 12 tempos em segundos.")
+        if not isinstance(fidelity_note, dict) or not fidelity_note:
+            raise ValueError("Envie a nota de fidelidade (fidelity_note).")
+        if strategy is not None and (not isinstance(strategy, str) or len(strategy) > 80):
+            raise ValueError("strategy inválida.")
+        with self.lock:
+            video = self.get(video_id)
+            if video["state"] not in V3_WAITING or video["meta"].get("cuts_timeout"):
+                raise ValueError(f"Vídeo em '{video['label']}': não aceita cortes.")
+            old = self.store.task(video["task_id"])["payload"] if video.get("task_id") else {}
+            if not old.get("edit"):
+                raise ValueError("Vídeo fora do padrão v3.")
+            payload = dict(video_id=video_id, edit_stage=True, model=old.get("model"), expected_cost=old.get("expected_cost"),
+                           edit=dict(old["edit"], cuts=cuts, fidelity_note=fidelity_note, strategy=strategy))
+            task_id = self.store.create_task("video", payload, deadline=VIDEO_TASK_SECONDS)
+            with self.store.db() as db:
+                db.execute("UPDATE videos SET task_id=?,state='queued',error=NULL WHERE id=?", (task_id, video_id))
+        self.update(video_id, state="queued")
+        self.store.log("info", f"Vídeo #{video_id}: cortes recebidos, edição na fila do worker.")
+        return self.get(video_id)
+
+    def expire_awaiting_cuts(self):
+        """Sem cortes depois de `edit_cuts_timeout_h` horas: falha na edição, nada enviado."""
+        hours = self.store.settings()["edit_cuts_timeout_h"]
+        limit = datetime.now(self.tz).timestamp() - hours * 3600
+        with self.store.db() as db:
+            rows = [dict(r) for r in db.execute("SELECT id,updated,meta FROM videos WHERE state='awaiting_cuts'")]
+        for row in rows:
+            if datetime.fromisoformat(row["updated"]).timestamp() < limit:
+                meta = dict(json.loads(row["meta"] or "{}"), cuts_timeout=True)
+                self.update(row["id"], state="edit_failed", meta=json.dumps(meta)[:4000],
+                            error=f"Sem cortes da rotina do agente em {hours} h.")
+                self.sync(row["id"])
+                self.store.log("error", f"Vídeo #{row['id']}: sem cortes em {hours} h; falha na edição, nada enviado.")
 
     def frames(self, task_id, worker_id, frames):
         """Up to three JPEG frames of the raw clip, used by the fidelity check (Modern mode)."""
@@ -447,10 +528,21 @@ class Videos:
             rows = [dict(r) for r in db.execute(f"""SELECT v.* FROM videos v JOIN tasks t ON t.id=v.task_id
                 WHERE t.status='expired' AND v.state IN ({','.join('?' * len(ACTIVE))})""", tuple(ACTIVE))]
         for video in rows:
+            try:
+                stage2 = bool(self.store.task(video["task_id"])["payload"].get("edit_stage"))
+            except (ValueError, KeyError, TypeError):
+                stage2 = False
+            # etapa 2 não concluída (em qualquer estado ativo): os créditos já foram gastos na etapa 1, o bruto
+            # segue no worker e nada foi enviado; mantém créditos e não libera nova geração.
+            if video["state"] == "editing" or stage2:
+                self.update(video["id"], state="edit_failed", error="O worker não concluiu a edição no prazo.")
+                self.sync(video["id"])
+                continue
             spent = video["state"] in CHARGED
             self.update(video["id"], state="unknown" if spent else "failed", credits=video["credits"] if spent else 0,
                         error="O worker não concluiu no prazo." + (" Confira o projeto no Flow." if spent else ""))
             self.sync(video["id"])
+        self.expire_awaiting_cuts()
         with self.store.db() as db:
             pending = [r[0] for r in db.execute("SELECT id FROM videos WHERE state='rendered'")]
         for video_id in pending:

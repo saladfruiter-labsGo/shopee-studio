@@ -28,8 +28,8 @@ DEFAULTS = dict(edit_min_s=10.0, edit_max_s=12.0, hook_end_s=6.0, shot_target_s=
                 edit_tolerance_s=0.15)  # ED-1: folga da duração final em relação a edit_min_s/edit_max_s (parâmetro, não literal)
 EXIT = {"ok": 0, "bad_args": 2, "transcription_failed": 3, "speech_too_long": 4, "too_short": 4, "bad_duration": 4,
         "static_shot": 5, "ffmpeg_failed": 6, "db_error": 7, "no_audio": 4, "raw_missing": 2, "cuts_missing": 2,
-        "invalid_result": 8, "fidelity_failed": 9}
-STATUSES = ("raw_delivered", "editing", "edited", "edit_failed")
+        "invalid_result": 8, "fidelity_failed": 9, "cuts_timeout": 2}
+STATUSES = ("raw_delivered", "aguardando_cortes", "editing", "edited", "edit_failed", "reprovado_fidelidade")
 
 
 class EditError(Exception):
@@ -100,6 +100,13 @@ def save_strategy_and_note(db, video_id, strategy, note):
     score = note.get("score") if isinstance(note, dict) else None
     _upsert(db, video_id, strategy=strategy, fidelity_note=json.dumps(note, ensure_ascii=False),
             fidelity_score=score if isinstance(score, int) and not isinstance(score, bool) else None)
+
+
+def set_status(db, video_id, status, code=None, message=None):
+    """Estado do clipe no SQLite do worker: `aguardando_cortes` (etapa 1), `reprovado_fidelidade` (etapa 2, nada enviado)."""
+    if status not in STATUSES:
+        raise EditError("db_error", f"status desconhecido: {status}")
+    _upsert(db, video_id, status=status, error_code=code, error=message, credits=0)
 
 
 # ---------- ffmpeg ----------
@@ -298,6 +305,8 @@ def edit_clip(db, video_id, out_dir, cfg=None, words=None, proposed=None, transc
     clip = get_clip(db, video_id)
     if not clip or not Path(clip["raw_path"] or "").is_file():
         raise EditError("raw_missing", f"Vídeo {video_id} sem bruto entregue (ED-13).")
+    if not proposed:  # ED-9: antes de gastar tempo com o whisper e sem mexer no estado (segue aguardando_cortes)
+        raise EditError("cuts_missing", "Sem cortes: eles vêm da rotina do agente com visão (ED-9); nenhum corte é inventado.")
     raw, out = Path(clip["raw_path"]), Path(out_dir) / f"video_{video_id}_editado.mp4"
     _upsert(db, video_id, status="editing", dry_run=int(dry_run), credits=0, error_code=None, error=None)
     try:
@@ -305,7 +314,7 @@ def edit_clip(db, video_id, out_dir, cfg=None, words=None, proposed=None, transc
         if not info["has_audio"]:
             raise EditError("no_audio", "O bruto não tem áudio; a fala nativa precisa estar no clipe (ED-7).")
         words = words if words is not None else transcriber(raw)
-        dead = dead_intervals(raw, cfg, words) if proposed else []
+        dead = dead_intervals(raw, cfg, words)
         plan = plan_cuts(info["duration"], words, cfg, proposed, dead)
         out.parent.mkdir(parents=True, exist_ok=True)
         done = run(build_command(raw, out, plan["start"], plan["end"], plan["keep"]))
@@ -333,6 +342,13 @@ def edit_clip(db, video_id, out_dir, cfg=None, words=None, proposed=None, transc
 
 
 # ---------- fidelidade do EDITADO (V3-7) ----------
+FIDELITY_RESULT_SCHEMA = {
+    "type": "object", "required": ["ok", "issues", "frames", "prompt", "score"],
+    "properties": {"ok": {"type": "boolean"}, "issues": {"type": "array", "items": {"type": "string"}},
+                   "frames": {"type": "array", "items": {"type": "string"}}, "prompt": {"type": "string"},
+                   "score": {"type": ["integer", "null"]}}}
+
+
 def fidelity_check(db, video_id, ficha, script, frames_dir=None):
     """Roda o vídeo editado pelo portão de fidelidade: quadros do editado para a rotina com visão (se `frames_dir`) e,
     se já há nota gravada, `v3.fidelity_issues` (cor por parte, ação das móveis, trajeto, destino). Sem nota: pendente."""
@@ -431,6 +447,17 @@ def make_fixture(out_dir, seconds=15):
     return clip, words
 
 
+def make_fixture_review():
+    """Ficha, cena de uso e nota de fidelidade de fixture (dry-run): o que a rotina do agente com visão mandaria."""
+    ficha = dict(parts=[dict(name="tampa", color="branca", material="plástico", movable=True, opens_how="gira",
+                             visible_in_photo=True)], does_not_open=["corpo"])
+    scene = dict(exit="bancada", route="cozinha", destination="geladeira")
+    note = dict(colors=[dict(part="tampa", expected="branca", seen="branca", ok=True)],
+                moving_parts=[dict(part="tampa", action_seen="gira", ok=True)],
+                route=dict(seen="cozinha", ok=True), destination=dict(seen="geladeira", ok=True), score=8)
+    return dict(ficha=ficha, use_scene=scene, fidelity_note=note, strategy="uso_real_trajeto")
+
+
 # ---------- CLI ----------
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="video_edit")
@@ -479,6 +506,9 @@ def main(argv=None):
         if args.command == "fidelity":
             result = fidelity_check(db, args.video_id, json.loads(Path(args.ficha).read_text()),
                                     json.loads(Path(args.script).read_text()), args.frames_out)
+            problems = validate(result, FIDELITY_RESULT_SCHEMA)
+            if problems:  # mesma regra do ED-14: nunca imprime JSON fora do schema
+                return emit(video_id, False, error=EditError("invalid_result", "saída fora do schema: " + "; ".join(problems)[:250]))
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result["ok"] else EXIT["fidelity_failed"]
         if args.command == "deliver-raw":

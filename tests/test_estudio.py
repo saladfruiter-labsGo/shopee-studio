@@ -111,6 +111,10 @@ class LinkTest(unittest.TestCase):
 
 class StudioTest(unittest.TestCase):
     def setUp(self):
+        # O Estúdio está desativado no padrão v3 (test_v3_panel.py prova a recusa); estes testes cobrem o código legado dele.
+        legacy = patch.object(studio_module, "STUDIO_V3_DISABLED", False)
+        legacy.start()
+        self.addCleanup(legacy.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         sleeper = patch("core.time.sleep")

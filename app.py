@@ -384,6 +384,17 @@ def create_app(data_dir=None, testing=False):
         engine.videos.frames(task_id, worker_id, body.get("frames"))
         return jsonify(ok=True)
 
+    @app.get("/api/worker/clips/<int:video_id>")
+    def clip_info(video_id):
+        return jsonify(engine.videos.clip_info(video_id))
+
+    @app.post("/api/worker/clips/<int:video_id>/edit")
+    def clip_edit(video_id):
+        # Padrão v3, etapa 2: a rotina do agente de visão (mesmo token do worker) manda os cortes e a nota de fidelidade.
+        payload = request.get_json() or {}
+        return jsonify(engine.videos.submit_cuts(video_id, payload.get("cuts"), payload.get("fidelity_note"),
+                                                 payload.get("strategy"))), 202
+
     @app.post("/api/videos")
     def video_create():
         body = request.get_json() or {}

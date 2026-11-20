@@ -50,6 +50,7 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 script_words_target=25, script_words_tol=3,
                 edit_min_s=10.0, edit_max_s=12.0, hook_end_s=6.0, shot_target_s=2.0, shot_tol_s=0.5,
                 static_max_s=1.5, word_margin_s=0.05, lead_silence_max_s=0.3,
+                edit_cuts_timeout_h=24,  # horas esperando os cortes da rotina do agente; depois: falha na edição, nada enviado
                 edit_tolerance_s=0.15)  # ED-1: folga de duração do editado em relação a edit_min_s/edit_max_s
 MODES = {"legacy", "modern"}
 DECISIONS = {"new", "planned", "published", "discarded"}
@@ -159,7 +160,7 @@ def validate_settings(payload, existing=None):
                            ("per_shop", 1, 10), ("studio_slots", 0, 10),
                            ("max_pages", 1, 500), ("page_limit", 1, 50),
                            ("video_daily_credits", 0, 2000), ("video_clip_cost_expected", 1, 500),
-                           ("script_words_target", 5, 80), ("script_words_tol", 0, 20)):
+                           ("script_words_target", 5, 80), ("script_words_tol", 0, 20), ("edit_cuts_timeout_h", 1, 720)):
         if not low <= result[key] <= high:
             raise ValueError(f"{key}: use {low} a {high}.")
     for key in ("edit_min_s", "edit_max_s", "hook_end_s", "shot_target_s", "shot_tol_s", "static_max_s"):

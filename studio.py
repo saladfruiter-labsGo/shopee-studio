@@ -137,6 +137,16 @@ def product_ids(url):
     return None
 
 
+# Padrão v3 (issue #14): o Estúdio ("Do dia" e manual) está desativado; não se adapta o Estúdio ao v3.
+STUDIO_V3_DISABLED = True
+STUDIO_V3_MESSAGE = "Estúdio desativado no padrão v3."
+
+
+def refuse_studio():
+    if STUDIO_V3_DISABLED:
+        raise ValueError(STUDIO_V3_MESSAGE)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args, **kwargs):
         return None
@@ -596,6 +606,7 @@ class Studio:
         return [Videos._public(row) for row in rows]
 
     def open_day(self, run_id, key):
+        refuse_studio()
         delivery = self.store.deliveries(run_id).get(key)
         snapshot = json.loads(delivery["snapshot"]) if delivery and delivery.get("snapshot") else {}
         if not snapshot.get("studio"):
@@ -616,6 +627,7 @@ class Studio:
         return self.get(self._create("dia", product, run_id))
 
     def create_manual(self, text):
+        refuse_studio()
         shop, item = resolve_link(text, self.redirector)
         node = self.engine.offer_fetcher(item, shop)
         if not node:
@@ -909,6 +921,7 @@ class Studio:
         return dict(caption=text, links=links, name=product["name"][:120], studio_session=row["id"])
 
     def generate(self, session_id, cost):
+        refuse_studio()
         """The user approved the cost on the screen (E3): one generation of 1 scene with the chosen script."""
         settings = self.store.settings()
         if isinstance(cost, bool) or cost != settings["video_clip_cost_expected"]:
