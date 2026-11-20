@@ -249,6 +249,7 @@ class ScriptV3Test(unittest.TestCase):
 
 
 # ---------- ED: edição ffmpeg com clipe de fixture ----------
+REVIEW = ve.make_fixture_review()  # ficha, cena de uso e nota que a rotina com visão mandaria
 CUTS = [6.4, 8.5, 10.6]  # cortes que a rotina com visão proporia para o clipe de fixture
 @unittest.skipUnless(HAS_FFMPEG, "ffmpeg/ffprobe indisponíveis")
 class EditTest(unittest.TestCase):
@@ -434,11 +435,12 @@ class EditTest(unittest.TestCase):
             ve.edit_clip(self.db, 1, self.work / "out", words=self.words, dry_run=True)
         self.assertEqual(ctx.exception.code, "cuts_missing")
         clip = ve.get_clip(self.db, 1)
-        self.assertEqual((clip["status"], clip["error_code"], clip["edited_path"]), ("edit_failed", "cuts_missing", None))
+        # cortes são checados ANTES do whisper e do estado: o clipe segue aguardando cortes, sem virar edit_failed
+        self.assertEqual((clip["status"], clip["error_code"], clip["edited_path"]), ("raw_delivered", None, None))
         self.assertFalse(hasattr(ve, "nominal_cuts"))
         code, data = self.cli("edit", "--db", str(self.work / "w.db"), "--video-id", "1", "--out", str(self.work / "o"),
                               "--words", str(self.words_file), "--dry-run")
-        self.assertEqual((code, data["error"]["code"], data["status"]), (2, "cuts_missing", "edit_failed"))
+        self.assertEqual((code, data["error"]["code"], data["status"]), (2, "cuts_missing", "raw_delivered"))
         self.assertEqual(ve.validate(data, ve.RESULT_SCHEMA), [])
 
     def test_ed4_static_plan_in_the_middle_is_cut_not_failed(self):
@@ -483,6 +485,35 @@ class EditTest(unittest.TestCase):
         self.assertEqual(ve.fidelity_check(self.db, 1, ficha, script)["issues"], [])
         ve.save_strategy_and_note(self.db, 1, "uso_real_trajeto", dict(note, colors=[]))
         self.assertTrue(ve.fidelity_check(self.db, 1, ficha, script)["issues"])
+
+    def test_minor_cuts_are_checked_before_whisper(self):
+        called = []
+        with self.assertRaises(ve.EditError) as ctx:
+            ve.edit_clip(self.db, 1, self.work / "out", words=None, transcriber=lambda p: called.append(p) or [], dry_run=True)
+        self.assertEqual((ctx.exception.code, called), ("cuts_missing", []))
+
+    def test_minor_fidelity_subcommand_output_passes_the_schema(self):
+        import contextlib
+        self.edit()
+        ficha, script = self.work / "f.json", self.work / "s.json"
+        ficha.write_text(json.dumps(REVIEW["ficha"]))
+        script.write_text(json.dumps(dict(use_scene=REVIEW["use_scene"])))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = ve.main(["fidelity", "--db", str(self.work / "w.db"), "--video-id", "1", "--ficha", str(ficha),
+                            "--script", str(script)])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, ve.validate(data, ve.FIDELITY_RESULT_SCHEMA)), (9, []))  # sem nota: reprovado
+        original = ve.fidelity_check
+        ve.fidelity_check = lambda *a, **k: dict(ok="sim")  # fora do schema
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = ve.main(["fidelity", "--db", str(self.work / "w.db"), "--video-id", "1", "--ficha", str(ficha),
+                                "--script", str(script)])
+        finally:
+            ve.fidelity_check = original
+        self.assertEqual((code, json.loads(out.getvalue())["error"]["code"]), (8, "invalid_result"))
 
     def test_schema_validator_rejects_bad_output(self):
         good = dict(ok=True, video_id=1, status="edited", raw_path="a", edited_path="b", duration=10.5, cuts=[], warnings=[],
@@ -535,12 +566,12 @@ class WorkerFlowTest(unittest.TestCase):
     def test_raw_is_delivered_before_the_edit_and_note_is_saved(self):
         stages = []
         result = self.sw.process_v3_clip(
-            self.config, 7, self.clip, dict(product_key="9:9", strategy="problema_real", fidelity_note=dict(score=8), cuts=CUTS),
+            self.config, 7, self.clip, dict(REVIEW, product_key="9:9", strategy="problema_real", cuts=CUTS),
             stage=lambda name, **kw: stages.append(name), words=ve.load_words(self.words_file), dry_run=True)
         row = self.row()
         self.assertEqual(stages, ["editing"])
         self.assertTrue(Path(row["raw_path"]).is_file() and Path(row["edited_path"]).is_file())
-        self.assertEqual((row["status"], row["credits"], row["strategy"], row["fidelity_score"]), ("edited", 0, "problema_real", 8))
+        self.assertEqual((row["status"], row["credits"], row["strategy"], row["fidelity_score"]), ("edited", 0, "problema_real", 8))  # nota do fixture: score 8
         self.assertTrue(10 - 0.15 <= result["duration"] <= 12 + 0.15)
         self.assertEqual(json.loads(row["cuts"]), result["cuts"])
 
@@ -553,9 +584,10 @@ class WorkerFlowTest(unittest.TestCase):
         self.assertEqual((row["status"], row["edited_path"], row["credits"]), ("edit_failed", None, 0))
         self.assertTrue(Path(row["raw_path"]).is_file())
 
-    def test_run_video_uploads_only_the_edited_clip_without_subtitles(self):
+    def fakes(self, uploads, progress):
+        """Flow falso + painel falso: sem rede, sem Flow, sem crédito."""
         import types
-        sw, clip, uploads, progress = self.sw, self.clip, [], []
+        sw, clip = self.sw, self.clip
 
         class FakeFlowError(Exception):
             pass
@@ -581,41 +613,115 @@ class WorkerFlowTest(unittest.TestCase):
         fake_subs = types.ModuleType("subtitles")
         fake_subs.subtitle_video = lambda *a, **k: self.fail("a edição v3 não pode legendar o vídeo (ED-6)")
         saved = {m: sys.modules.get(m) for m in ("flow", "subtitles")}
-        originals = (sw.call, sw.upload_video, sw.task_images, sw.WORK)
+        originals = (sw.call, sw.upload_video, sw.task_images, sw.WORK, ve.whisper_words)
         sw.call = lambda url, token, path, payload, timeout=30: progress.append(payload.get("stage"))
         sw.upload_video = lambda url, token, task_id, worker_id, path: uploads.append(Path(path))
         sw.task_images = lambda *a: [self.clip]
         sw.WORK = self.work
-        sys.modules.update(flow=fake_flow, subtitles=fake_subs)
         words = ve.load_words(self.words_file)
-        original_whisper = ve.whisper_words
         ve.whisper_words = lambda raw, model="small": words  # o dry_run usa o JSON de palavras do fixture
-        try:
-            task = dict(id=7, payload=dict(project_url="u", prompt="p", expected_cost=60, model="m",
-                                           edit=dict(product_key="9:9", strategy="problema_real", cuts=CUTS)))
-            meta = sw.run_video(self.config, task, "w")
-        finally:
-            ve.whisper_words = original_whisper
-            sw.call, sw.upload_video, sw.task_images, sw.WORK = originals
+        sys.modules.update(flow=fake_flow, subtitles=fake_subs)
+
+        def restore():
+            sw.call, sw.upload_video, sw.task_images, sw.WORK, ve.whisper_words = originals
             for name, module in saved.items():
                 sys.modules.pop(name, None) if module is None else sys.modules.__setitem__(name, module)
+        self.addCleanup(restore)
+
+    def stage1(self, uploads, progress, **edit):
+        task = dict(id=7, payload=dict(video_id=7, project_url="u", prompt="p", expected_cost=60, model="m",
+                                       edit=dict(product_key="9:9", **edit)))
+        return self.sw.run_video(self.config, task, "w")
+
+    def stage2(self, **edit):
+        task = dict(id=8, payload=dict(video_id=7, edit_stage=True, edit=dict(product_key="9:9", **edit)))
+        return self.sw.run_edit_task(self.config, task, "w")
+
+    def test_ed_two_steps_stage1_waits_for_cuts_and_sends_nothing(self):
+        uploads, progress = [], []
+        self.fakes(uploads, progress)
+        output = self.stage1(uploads, progress, ficha=REVIEW["ficha"], use_scene=REVIEW["use_scene"])
+        row = self.row()
+        self.assertEqual((output["awaiting_cuts"], row["status"], row["credits"], row["edited_path"]),
+                         (True, "aguardando_cortes", 0, None))
+        self.assertTrue(Path(row["raw_path"]).is_file())
+        self.assertGreater(output["frames"], 0)
+        self.assertEqual(uploads, [])  # nada enviado, nem editado nem bruto
+        self.assertNotIn("editing", progress)
+
+    def test_ed_two_steps_stage2_edits_checks_and_uploads_only_the_edited_clip(self):
+        uploads, progress = [], []
+        self.fakes(uploads, progress)
+        self.stage1(uploads, progress)
+        meta = self.stage2(cuts=CUTS, **REVIEW)
         row = self.row()
         self.assertEqual([p.name for p in uploads], ["video_7_editado.mp4"])
         self.assertEqual(str(uploads[0]), row["edited_path"])
         self.assertTrue(Path(row["raw_path"]).is_file())
-        self.assertLess(progress.index("approving"), progress.index("editing") if "editing" in progress else 99)
-        self.assertTrue(10 - 0.15 <= meta["duration"] <= 12 + 0.15)
+        self.assertEqual((row["status"], row["credits"]), ("edited", 0))
+        self.assertLess(progress.index("editing"), progress.index("uploading"))
+        self.assertTrue(meta["fidelity_ok"] and 10 - 0.15 <= meta["duration"] <= 12 + 0.15)
+
+    def test_fidelity_without_note_blocks_the_upload_and_keeps_raw_and_edited(self):
+        uploads, progress = [], []
+        self.fakes(uploads, progress)
+        self.stage1(uploads, progress)
+        with self.assertRaises(self.sw.VideoError) as caught:
+            self.stage2(cuts=CUTS, ficha=REVIEW["ficha"], use_scene=REVIEW["use_scene"])  # sem nota
+        row = self.row()
+        self.assertEqual((caught.exception.code, row["status"], uploads), ("fidelity_failed", "reprovado_fidelidade", []))
+        self.assertTrue(Path(row["raw_path"]).is_file() and Path(row["edited_path"]).is_file())
+
+    def test_fidelity_with_issue_blocks_the_upload(self):
+        uploads, progress = [], []
+        self.fakes(uploads, progress)
+        self.stage1(uploads, progress)
+        bad = dict(REVIEW["fidelity_note"], colors=[])  # nota sem a cor da parte
+        with self.assertRaises(self.sw.VideoError) as caught:
+            self.stage2(cuts=CUTS, **dict(REVIEW, fidelity_note=bad))
+        row = self.row()
+        self.assertEqual((caught.exception.code, row["status"], uploads), ("fidelity_failed", "reprovado_fidelidade", []))
+        self.assertIn("cor da parte", row["error"])
+        self.assertTrue(Path(row["raw_path"]).is_file() and Path(row["edited_path"]).is_file())
 
     def test_cli_dry_run_covers_the_whole_flow_with_zero_credit(self):
         out = io.StringIO()
         with redirect_stdout(out):
             cuts = self.work / "cuts.json"
             cuts.write_text(json.dumps(dict(cuts=CUTS)))
-            code = self.sw.dry_run_edit(["--clip", str(self.clip), "--words", str(self.words_file),
-                                         "--cuts", str(cuts), "--workdir", str(self.work / "cli")])
+            review = self.work / "review.json"
+            review.write_text(json.dumps(REVIEW))
+            code = self.sw.dry_run_edit(["--clip", str(self.clip), "--words", str(self.words_file), "--cuts", str(cuts),
+                                         "--review", str(review), "--workdir", str(self.work / "cli")])
         data = json.loads(out.getvalue())
         self.assertEqual((code, data["ok"], data["credits"], data["dry_run"]), (0, True, 0, True))
         self.assertTrue(Path(data["raw_path"]).is_file() and Path(data["edited_path"]).is_file())
+        self.assertEqual(data["stage1"], "aguardando_cortes")
+
+    def test_cli_dry_run_fixture_stage1_only_waits_for_cuts(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = self.sw.dry_run_edit(["--stage1-only", "--workdir", str(self.work / "s1")])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["status"], data["sent"], data["credits"]), (0, "aguardando_cortes", False, 0))
+
+    def test_cli_dry_run_fixture_full_flow_is_edited_10_to_12_seconds(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = self.sw.dry_run_edit(["--workdir", str(self.work / "full")])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["credits"]), (0, 0))
+        self.assertTrue(10 - 0.15 <= data["duration"] <= 12 + 0.15)
+
+    def test_cli_dry_run_with_own_clip_without_review_is_refused_by_fidelity(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            cuts = self.work / "c.json"
+            cuts.write_text(json.dumps(dict(cuts=CUTS)))
+            code = self.sw.dry_run_edit(["--clip", str(self.clip), "--words", str(self.words_file), "--cuts", str(cuts),
+                                         "--workdir", str(self.work / "norev")])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["ok"], data["error"]["code"]), (9, False, "fidelity_failed"))
 
 
 class ConfigV3Test(unittest.TestCase):

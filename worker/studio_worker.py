@@ -23,7 +23,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 CONFIG = Path.home() / ".config" / "shopee-studio-worker" / "config.json"
 WORK = Path.home() / ".cache" / "shopee-studio-worker"
 IMAGE_HOSTS = ("susercontent.com", "shopee.com.br", "shopee.com", "img.shopee")
@@ -161,48 +161,83 @@ def task_images(config, task, worker_id, folder):
     return paths
 
 
-def process_v3_clip(config, video_id, raw, edit, stage=None, words=None, dry_run=False):
-    """Padrão v3 (ED-10..ED-13): entrega o bruto (arquivo + SQLite) ANTES de editar, depois edita com ffmpeg.
-    `edit` é o bloco `edit` do payload: product_key, strategy, fidelity_note, cuts (tempos propostos pela rotina do
-    agente com visão, ED-9) e config (faixas). Sem transcrição por palavra não há edição nem envio (ED-8).
-    Falha na edição (ED-11): o bruto fica, status edit_failed, crédito 0 e nada é enviado. Devolve o resultado da edição."""
+def v3_deliver(config, video_id, raw, edit):
+    """Etapa 1 (ED-13): grava o bruto (arquivo + SQLite), extrai os quadros para a rotina do agente com visão e deixa o
+    clipe em `aguardando_cortes`. Não edita, não envia, não inventa corte."""
     sys.path.insert(0, str(HERE))
     import video_edit as ve
-    stage = stage or (lambda name, **extra: None)
     clips = Path(config["clips_dir"])
     clips.mkdir(parents=True, exist_ok=True)
     db = ve.connect(clips / "clips.sqlite")
     try:
+        path = ve.deliver_raw(db, video_id, str(edit.get("product_key") or video_id), raw, clips / "raw")
+        frames = ve.extract_frames(path, clips / "frames" / f"video_{video_id}_bruto")
+        ve.set_status(db, video_id, "aguardando_cortes")
+        return dict(awaiting_cuts=True, raw_path=path, frames_dir=str(frames[0].parent) if frames else None,
+                    frames=len(frames))
+    except ve.EditError as error:
+        raise VideoError("download_failed", f"{error.code}: {error}", True) from error
+    finally:
+        db.close()
+
+
+def v3_edit(config, video_id, edit, stage=None, words=None, dry_run=False):
+    """Etapa 2: com cortes + nota de fidelidade vindos da rotina do agente, edita, confere e só então libera o envio.
+    Falha na edição (ED-11): o bruto fica, `edit_failed`, crédito 0, nada enviado. Fidelidade (V3-7): sem nota ou com
+    issues o editado fica guardado como `reprovado_fidelidade` e NÃO é enviado (`fidelity_failed`)."""
+    sys.path.insert(0, str(HERE))
+    import video_edit as ve
+    stage = stage or (lambda name, **extra: None)
+    clips = Path(config["clips_dir"])
+    db = ve.connect(clips / "clips.sqlite")
+    try:
         try:
-            ve.deliver_raw(db, video_id, str(edit.get("product_key") or video_id), raw, clips / "raw")
             if edit.get("strategy") or edit.get("fidelity_note"):  # V3-8: vem de fora, da rotina que orquestra
                 ve.save_strategy_and_note(db, video_id, edit.get("strategy"), edit.get("fidelity_note") or {})
             stage("editing")
             transcriber = lambda path: ve.whisper_words(path, config.get("whisper_model", "small"))
-            result = ve.edit_clip(db, video_id, clips / "edited", ve.config(edit.get("config")), words, edit.get("cuts") or None,
-                                  transcriber=transcriber, dry_run=dry_run)
-            if edit.get("ficha") and edit.get("use_scene"):  # V3-7: o EDITADO passa pelo portão de fidelidade
-                script = dict(use_scene=edit["use_scene"])
-                result["fidelity"] = ve.fidelity_check(db, video_id, edit["ficha"], script,
-                                                       clips / "frames" / f"video_{video_id}")
+            result = ve.edit_clip(db, video_id, clips / "edited", ve.config(edit.get("config")), words,
+                                  edit.get("cuts") or None, transcriber=transcriber, dry_run=dry_run)
+            if edit.get("ficha") and edit.get("use_scene"):
+                check = ve.fidelity_check(db, video_id, edit["ficha"], dict(use_scene=edit["use_scene"]),
+                                          clips / "frames" / f"video_{video_id}")
+                issues = check["issues"]
+            else:
+                issues = ["sem ficha ou cena de uso para conferir a fidelidade"]
+            if issues:
+                message = "reprovado na fidelidade: " + "; ".join(issues)[:300]
+                ve.set_status(db, video_id, "reprovado_fidelidade", "fidelity_failed", message)
+                raise ve.EditError("fidelity_failed", message)
+            result["fidelity"] = dict(ok=True, issues=[])
             return result
         except ve.EditError as error:
-            wrapped = VideoError("edit_failed", f"{error.code}: {error}", True)
+            wrapped = VideoError("fidelity_failed" if error.code == "fidelity_failed" else "edit_failed",
+                                 f"{error.code}: {error}", True)
             wrapped.edit_code = error.code
             raise wrapped from error
     finally:
         db.close()
 
 
+def process_v3_clip(config, video_id, raw, edit, stage=None, words=None, dry_run=False):
+    """As duas etapas em sequência (dry-run e testes). No worker real elas são tarefas separadas: entre uma e outra o
+    vídeo espera os cortes da rotina do agente (`aguardando_cortes`)."""
+    v3_deliver(config, video_id, raw, edit)
+    return v3_edit(config, video_id, edit, stage, words, dry_run)
+
+
 def dry_run_edit(argv):
-    """(sem --clip, usa cortes de fixture; com --clip, --cuts é obrigatório: nenhum corte é inventado)
-    `studio_worker.py --dry-run-edit [--clip MP4] [--words JSON] [--cuts JSON] [--workdir PASTA]`: o fluxo bruto → edição
-    sem painel, sem Flow e sem crédito (0). Sem --clip usa um clipe de fixture gerado com ffmpeg. Imprime um JSON."""
+    """`studio_worker.py --dry-run-edit [--clip MP4] [--words JSON] [--cuts JSON] [--review JSON] [--stage1-only] [--workdir D]`:
+    etapa 1 (bruto, quadros, aguardando_cortes) e etapa 2 (edição, fidelidade) sem painel, Flow nem crédito (0).
+    Sem --clip usa fixture com cortes e nota próprios; com --clip, --cuts e --review (ficha, use_scene, fidelity_note)
+    são obrigatórios: nada é inventado. Imprime um JSON."""
     import argparse
     parser = argparse.ArgumentParser(prog="studio_worker --dry-run-edit")
     parser.add_argument("--clip")
     parser.add_argument("--words")
     parser.add_argument("--cuts")
+    parser.add_argument("--review")
+    parser.add_argument("--stage1-only", action="store_true")
     parser.add_argument("--workdir", default=str(WORK / "dry-run"))
     args = parser.parse_args(argv)
     sys.path.insert(0, str(HERE))
@@ -215,15 +250,41 @@ def dry_run_edit(argv):
             clip, words_file = Path(args.clip), Path(args.words) if args.words else Path(args.clip).with_suffix(".words.json")
         words = ve.load_words(words_file) if words_file.is_file() else None
         cuts = json.loads(Path(args.cuts).read_text())["cuts"] if args.cuts else (None if args.clip else [7.0, 9.1, 11.2])
+        review = json.loads(Path(args.review).read_text()) if args.review else (None if args.clip else ve.make_fixture_review())
         config = dict(clips_dir=str(work / "clips"), whisper_model="small")
-        result = process_v3_clip(config, 1, clip, dict(product_key="dry-run", cuts=cuts), words=words, dry_run=True)
-        print(json.dumps(dict(ok=True, dry_run=True, credits=0, **result), ensure_ascii=False))
+        edit = dict(product_key="dry-run", cuts=cuts, **(review or {}))
+        stage1 = v3_deliver(config, 1, clip, edit)
+        if args.stage1_only:
+            print(json.dumps(dict(ok=True, dry_run=True, credits=0, status="aguardando_cortes", sent=False, **stage1),
+                             ensure_ascii=False))
+            return 0
+        result = v3_edit(config, 1, edit, words=words, dry_run=True)
+        print(json.dumps(dict(ok=True, dry_run=True, credits=0, stage1="aguardando_cortes", **result), ensure_ascii=False))
         return 0
     except (VideoError, ve.EditError, OSError, ValueError) as error:
         code = getattr(error, "edit_code", None) or getattr(error, "code", "bad_args")
         print(json.dumps(dict(ok=False, dry_run=True, credits=0, error=dict(code=code, message=str(error)[:300])),
                          ensure_ascii=False))
         return ve.EXIT.get(code, 1)
+
+
+def run_edit_task(config, task, worker_id):
+    """Etapa 2 como tarefa da fila: o painel a cria quando a rotina do agente manda cortes + nota de fidelidade."""
+    sys.path.insert(0, str(HERE))
+    payload = task["payload"]
+    url, token = config["panel_url"], config["token"]
+    stage = lambda name, **extra: call(url, token, f"/api/worker/tasks/{task['id']}/progress",
+                                       dict(worker_id=worker_id, stage=name, **extra))
+    try:
+        result = v3_edit(config, int(payload["video_id"]), payload["edit"], stage)
+    except VideoError:
+        raise
+    except Exception as error:
+        raise VideoError("edit_failed", str(error)[:400], True) from error
+    stage("uploading")
+    upload_video(url, token, task["id"], worker_id, result["edited_path"])
+    return dict(duration=result["duration"], cuts=result["cuts"], warnings=result["warnings"], fidelity_ok=True,
+                fidelity=[], v3=True)
 
 
 def run_video(config, task, worker_id):
@@ -267,14 +328,8 @@ def run_video(config, task, worker_id):
             except Exception as error:  # The fidelity check is advisory: the video still goes on.
                 log(f"Tarefa {task['id']}: quadros para a fidelidade não enviados ({error})")
         edit = payload.get("edit")
-        if edit:  # Padrão v3: entrega o bruto, edita só com corte (sem legenda, selo nem texto sobre o vídeo, ED-6)
-            result = process_v3_clip(config, task["id"], raw, edit, stage)
-            final = Path(result["edited_path"])
-            meta = dict(duration=result["duration"], cuts=result["cuts"], warnings=result["warnings"],
-                        fidelity=(result.get("fidelity") or {}).get("issues"))
-            stage("uploading")
-            upload_video(url, token, task["id"], worker_id, final)
-            return meta
+        if edit:  # Padrão v3, etapa 1: bruto + quadros e para. A edição só vem com os cortes da rotina do agente.
+            return v3_deliver(config, payload.get("video_id") or task["id"], raw, edit)
         stage("subtitling")
         final = folder / "final.mp4"
         meta = subtitles.subtitle_video(raw, payload.get("narration", ""), final, folder, config["whisper_model"],
@@ -333,7 +388,7 @@ def loop(config, kind, worker_id):
         threading.Thread(target=heartbeat, args=(url, token, worker_id, busy), daemon=True).start()
         try:
             if kind == "video":
-                output = run_video(config, task, worker_id)
+                output = (run_edit_task if task["payload"].get("edit_stage") else run_video)(config, task, worker_id)
             else:
                 output = run_llm(task["payload"], task["seconds_left"])
             report = dict(worker_id=worker_id, ok=True, output=output)
