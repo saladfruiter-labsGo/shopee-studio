@@ -8,7 +8,7 @@ config_dir="$HOME/.config/shopee-studio-worker"
 venv="$target/venv"
 mkdir -p "$target" "$HOME/.config/systemd/user" "$config_dir"
 chmod 700 "$config_dir"
-for file in studio_worker.py flow.py subtitles.py; do
+for file in studio_worker.py flow.py flow_steps.py video_edit.py subtitles.py; do
   install -m 0644 "$here/$file" "$target/$file"
 done
 install -m 0755 "$here/flow_login.sh" "$target/flow_login.sh"

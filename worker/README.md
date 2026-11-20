@@ -34,6 +34,28 @@ Dois laços independentes rodam no mesmo serviço: `hermes` (tarefas de modelo) 
 - **Estúdio (worker 1.3.0):** a tarefa pode trazer `images` (até 4, a principal primeiro): fotos do anúncio por URL e fotos do usuário por id, baixadas do painel em `GET /api/worker/tasks/<id>/images/<foto>` com o token e o `X-Worker-Id`. Cada referência vira `p<tarefa>r<n>.jpg`; o compositor é fixado em **Elementos** (em Frames, duas imagens viram quadro inicial/final), as imagens são anexadas uma a uma e o worker confere que a caixa tem exatamente N anexos antes de enviar. A âncora da galeria é a **última** imagem enviada. Tarefas sem `images` (vídeo automático) continuam com `produto<tarefa>.jpg`. Validado sem crédito em 12/11/2026 com `generate(..., dry_run=True)`: 2 anexos, custo 15.
 - **Modo Moderno (worker 1.2.0):** quando a tarefa traz `finish`, o worker extrai 3 quadros do clipe cru (20%, 50% e 80%, 360 px, JPEG) e os envia a `/api/worker/tasks/<id>/frames` para a conferência de fidelidade; depois renderiza num único ffmpeg em 1080×1920, 30 fps (fundo desfocado se a proporção não for 9:16), com legenda, selo de compra nos últimos 3,5 s e áudio `loudnorm`/AAC. Falha ao mandar os quadros só fica no log — o vídeo segue. Tarefas sem `finish` (Modo Legacy) saem como antes.
 
+## Padrão v3: bruto entregue, depois edição (worker 1.5.0, issue #14)
+
+Quando o payload da tarefa de vídeo traz o bloco `edit`, o worker **não** legenda nem põe selo ou texto sobre o vídeo (ED-6). O fluxo é:
+
+1. O Flow gera o clipe bruto (custo esperado e `video_daily_credits` vêm da config; padrão 0 = nenhuma geração real).
+2. `deliver_raw` copia o bruto para `<clips_dir>/raw/video_<id>_bruto.mp4` e registra no SQLite `<clips_dir>/clips.sqlite` (`status=raw_delivered`) **antes** de qualquer edição (ED-13). `clips_dir` é configurável; o padrão é `~/.cache/shopee-studio-worker/clips`.
+3. `edit_clip` corta com ffmpeg em 10–12 s, mantém o áudio nativo e grava bruto, editado e lista de cortes (`status=edited`). Só o editado é enviado ao painel.
+4. Falha na edição (ED-11, inclusive sem transcrição por palavra, ED-8): o bruto fica, `status=edit_failed`, crédito 0, **nada é enviado** e a tarefa devolve `edit_failed` (cobrada, sem regerar).
+
+Bloco `edit` do payload: `product_key`, `strategy` e `fidelity_note` (V3-8, gravados no SQLite), `cuts` (tempos em segundos escolhidos com visão, ED-9) e `config` (faixas da edição, ex.: `edit_min_s`, `edit_max_s`).
+
+**Quem orquestra a visão (a rotina do agente).** O worker não tem visão. Quem decide os cortes por visão (ED-9) e escreve a nota de fidelidade é a rotina do agente: ela extrai quadros do bruto (`video_edit.py frames --raw X --out D`), olha os quadros e então manda `edit.cuts` e `edit.fidelity_note` no payload da tarefa ou, fora do Flow, chama a CLI `video_edit.py edit --cuts cortes.json`. Sem `cuts`, a edição usa os cortes nominais. A nota nunca é gerada pelo worker.
+
+**Transcrição.** `faster-whisper` está em `worker/requirements.txt` (mesmas versões do `install.sh`). Quem instala é o `install.sh`, depois do clique do igaoeu; sem ele a transcrição falha, a edição não roda e nada é enviado. Com fala densa, um plano pode passar da faixa de 1,5–2,5 s (ex.: 2,62 s): o ED-8 (não cortar palavra) prevalece sobre o ED-3 e o aviso fica registrado em `warnings`.
+
+**Dry run (0 crédito, sem Flow, sem painel).**
+
+    python3 worker/studio_worker.py --dry-run-edit --workdir /tmp/dry            # gera clipe de fixture com ffmpeg
+    python3 worker/studio_worker.py --dry-run-edit --clip X.mp4 --words X.words.json --workdir /tmp/dry
+
+Imprime um JSON (`ok`, `credits`=0, `raw_path`, `edited_path`, `duration`, `cuts`, `warnings`) e sai com 0, ou com o código de `video_edit.py` (2, 3, 4, 5, 6, 7) em falha.
+
 ### Login, 2FA ou CAPTCHA
 
 Quando o Google pede login ou verificação, a fila pausa e chega um alerta no Telegram. Na VM:

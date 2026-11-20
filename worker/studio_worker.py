@@ -23,12 +23,13 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 CONFIG = Path.home() / ".config" / "shopee-studio-worker" / "config.json"
 WORK = Path.home() / ".cache" / "shopee-studio-worker"
 IMAGE_HOSTS = ("susercontent.com", "shopee.com.br", "shopee.com", "img.shopee")
 IMAGE_LIMIT = 6 * 1024 * 1024
 IDLE_SECONDS = 5
+HERE = Path(__file__).resolve().parent
 
 
 def log(message):
@@ -50,6 +51,7 @@ def load_config():
     config.setdefault("flow_profile", str(DEFAULT_PROFILE))
     config.setdefault("display", ":95")
     config.setdefault("whisper_model", "small")
+    config.setdefault("clips_dir", str(WORK / "clips"))  # bruto, editado e SQLite ficam fora da pasta temporária da tarefa
     return config
 
 
@@ -159,6 +161,65 @@ def task_images(config, task, worker_id, folder):
     return paths
 
 
+def process_v3_clip(config, video_id, raw, edit, stage=None, words=None, dry_run=False):
+    """Padrão v3 (ED-10..ED-13): entrega o bruto (arquivo + SQLite) ANTES de editar, depois edita com ffmpeg.
+    `edit` é o bloco `edit` do payload: product_key, strategy, fidelity_note, cuts (tempos propostos pela rotina do
+    agente com visão, ED-9) e config (faixas). Sem transcrição por palavra não há edição nem envio (ED-8).
+    Falha na edição (ED-11): o bruto fica, status edit_failed, crédito 0 e nada é enviado. Devolve o resultado da edição."""
+    sys.path.insert(0, str(HERE))
+    import video_edit as ve
+    stage = stage or (lambda name, **extra: None)
+    clips = Path(config["clips_dir"])
+    clips.mkdir(parents=True, exist_ok=True)
+    db = ve.connect(clips / "clips.sqlite")
+    try:
+        try:
+            ve.deliver_raw(db, video_id, str(edit.get("product_key") or video_id), raw, clips / "raw")
+            if edit.get("strategy") or edit.get("fidelity_note"):  # V3-8: vem de fora, da rotina que orquestra
+                ve.save_strategy_and_note(db, video_id, edit.get("strategy"), edit.get("fidelity_note") or {})
+            stage("editing")
+            transcriber = lambda path: ve.whisper_words(path, config.get("whisper_model", "small"))
+            return ve.edit_clip(db, video_id, clips / "edited", ve.config(edit.get("config")), words, edit.get("cuts") or None,
+                                transcriber=transcriber, dry_run=dry_run)
+        except ve.EditError as error:
+            wrapped = VideoError("edit_failed", f"{error.code}: {error}", True)
+            wrapped.edit_code = error.code
+            raise wrapped from error
+    finally:
+        db.close()
+
+
+def dry_run_edit(argv):
+    """`studio_worker.py --dry-run-edit [--clip MP4] [--words JSON] [--cuts JSON] [--workdir PASTA]`: o fluxo bruto → edição
+    sem painel, sem Flow e sem crédito (0). Sem --clip usa um clipe de fixture gerado com ffmpeg. Imprime um JSON."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="studio_worker --dry-run-edit")
+    parser.add_argument("--clip")
+    parser.add_argument("--words")
+    parser.add_argument("--cuts")
+    parser.add_argument("--workdir", default=str(WORK / "dry-run"))
+    args = parser.parse_args(argv)
+    sys.path.insert(0, str(HERE))
+    import video_edit as ve
+    work = Path(args.workdir)
+    try:
+        if not args.clip:
+            clip, words_file = ve.make_fixture(work / "fixture")
+        else:
+            clip, words_file = Path(args.clip), Path(args.words) if args.words else Path(args.clip).with_suffix(".words.json")
+        words = ve.load_words(words_file) if words_file.is_file() else None
+        cuts = json.loads(Path(args.cuts).read_text())["cuts"] if args.cuts else None
+        config = dict(clips_dir=str(work / "clips"), whisper_model="small")
+        result = process_v3_clip(config, 1, clip, dict(product_key="dry-run", cuts=cuts), words=words, dry_run=True)
+        print(json.dumps(dict(ok=True, dry_run=True, credits=0, **result), ensure_ascii=False))
+        return 0
+    except (VideoError, ve.EditError, OSError, ValueError) as error:
+        code = getattr(error, "edit_code", None) or getattr(error, "code", "bad_args")
+        print(json.dumps(dict(ok=False, dry_run=True, credits=0, error=dict(code=code, message=str(error)[:300])),
+                         ensure_ascii=False))
+        return ve.EXIT.get(code, 1)
+
+
 def run_video(config, task, worker_id):
     """Generate in Flow, subtitle the narration, upload the MP4. Returns metadata; raises FlowError."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -199,6 +260,14 @@ def run_video(config, task, worker_id):
                      dict(worker_id=worker_id, frames=[base64.b64encode(f.read_bytes()).decode() for f in frames]))
             except Exception as error:  # The fidelity check is advisory: the video still goes on.
                 log(f"Tarefa {task['id']}: quadros para a fidelidade não enviados ({error})")
+        edit = payload.get("edit")
+        if edit:  # Padrão v3: entrega o bruto, edita só com corte (sem legenda, selo nem texto sobre o vídeo, ED-6)
+            result = process_v3_clip(config, task["id"], raw, edit, stage)
+            final = Path(result["edited_path"])
+            meta = dict(duration=result["duration"], cuts=result["cuts"], warnings=result["warnings"])
+            stage("uploading")
+            upload_video(url, token, task["id"], worker_id, final)
+            return meta
         stage("subtitling")
         final = folder / "final.mp4"
         meta = subtitles.subtitle_video(raw, payload.get("narration", ""), final, folder, config["whisper_model"],
@@ -211,6 +280,8 @@ def run_video(config, task, worker_id):
         return meta
     except FlowError as error:
         error.charged = error.charged or charged
+        raise
+    except VideoError:
         raise
     except Exception as error:
         raise VideoError("download_failed" if charged else "ui_changed", str(error)[:400], charged) from error
@@ -280,6 +351,9 @@ def video_ready():
 
 
 def main():
+    if "--dry-run-edit" in sys.argv[1:]:
+        args = [a for a in sys.argv[1:] if a != "--dry-run-edit"]
+        sys.exit(dry_run_edit(args))
     config = load_config()
     host = socket.gethostname()[:50]
     log(f"Worker {VERSION} em {host}; painel {config['panel_url']}")
