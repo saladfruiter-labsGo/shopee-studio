@@ -406,5 +406,116 @@ class EditTest(unittest.TestCase):
             validate_settings(dict(edit_min_s=13.0))
 
 
+# ---------- worker: bruto entregue -> edição -> envio (ligação em studio_worker.py) ----------
+@unittest.skipUnless(HAS_FFMPEG, "ffmpeg ausente")
+class WorkerFlowTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import studio_worker
+        cls.sw = studio_worker
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.base = Path(cls.temp.name)
+        cls.clip, cls.words_file = ve.make_fixture(cls.base / "fx")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def setUp(self):
+        self.work = Path(tempfile.mkdtemp(dir=self.base))
+        self.config = dict(clips_dir=str(self.work / "clips"), whisper_model="small", panel_url="http://x", token="t",
+                           flow_profile="p", display=":0")
+
+    def row(self, video_id=7):
+        db = ve.connect(Path(self.config["clips_dir"]) / "clips.sqlite")
+        try:
+            return ve.get_clip(db, video_id)
+        finally:
+            db.close()
+
+    def test_raw_is_delivered_before_the_edit_and_note_is_saved(self):
+        stages = []
+        result = self.sw.process_v3_clip(
+            self.config, 7, self.clip, dict(product_key="9:9", strategy="problema_real", fidelity_note=dict(score=8)),
+            stage=lambda name, **kw: stages.append(name), words=ve.load_words(self.words_file), dry_run=True)
+        row = self.row()
+        self.assertEqual(stages, ["editing"])
+        self.assertTrue(Path(row["raw_path"]).is_file() and Path(row["edited_path"]).is_file())
+        self.assertEqual((row["status"], row["credits"], row["strategy"], row["fidelity_score"]), ("edited", 0, "problema_real", 8))
+        self.assertTrue(10 - 0.15 <= result["duration"] <= 12 + 0.15)
+        self.assertEqual(json.loads(row["cuts"]), result["cuts"])
+
+    def test_transcription_failure_keeps_raw_and_sends_nothing(self):  # ED-8 + ED-11, sem faster-whisper neste host
+        with self.assertRaises(self.sw.VideoError) as caught:
+            self.sw.process_v3_clip(self.config, 7, self.clip, dict(product_key="9:9"), words=None, dry_run=True)
+        self.assertEqual((caught.exception.code, caught.exception.edit_code, caught.exception.charged),
+                         ("edit_failed", "transcription_failed", True))
+        row = self.row()
+        self.assertEqual((row["status"], row["edited_path"], row["credits"]), ("edit_failed", None, 0))
+        self.assertTrue(Path(row["raw_path"]).is_file())
+
+    def test_run_video_uploads_only_the_edited_clip_without_subtitles(self):
+        import types
+        sw, clip, uploads, progress = self.sw, self.clip, [], []
+
+        class FakeFlowError(Exception):
+            pass
+
+        class FakeFlow:
+            def __init__(self, *a, **k):
+                pass
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def generate(self, project, images, prompt, cost, model, before_approve, stage, folder):
+                before_approve(cost)
+                stage("submitted")
+                target = Path(folder) / "raw.mp4"
+                shutil.copy(clip, target)
+                return target
+            def screenshot(self, path):
+                pass
+
+        fake_flow = types.ModuleType("flow")
+        fake_flow.Flow, fake_flow.FlowError = FakeFlow, FakeFlowError
+        fake_subs = types.ModuleType("subtitles")
+        fake_subs.subtitle_video = lambda *a, **k: self.fail("a edição v3 não pode legendar o vídeo (ED-6)")
+        saved = {m: sys.modules.get(m) for m in ("flow", "subtitles")}
+        originals = (sw.call, sw.upload_video, sw.task_images, sw.WORK)
+        sw.call = lambda url, token, path, payload, timeout=30: progress.append(payload.get("stage"))
+        sw.upload_video = lambda url, token, task_id, worker_id, path: uploads.append(Path(path))
+        sw.task_images = lambda *a: [self.clip]
+        sw.WORK = self.work
+        sys.modules.update(flow=fake_flow, subtitles=fake_subs)
+        words = ve.load_words(self.words_file)
+        original_whisper = ve.whisper_words
+        ve.whisper_words = lambda raw, model="small": words  # o dry_run usa o JSON de palavras do fixture
+        try:
+            task = dict(id=7, payload=dict(project_url="u", prompt="p", expected_cost=60, model="m",
+                                           edit=dict(product_key="9:9", strategy="problema_real")))
+            meta = sw.run_video(self.config, task, "w")
+        finally:
+            ve.whisper_words = original_whisper
+            sw.call, sw.upload_video, sw.task_images, sw.WORK = originals
+            for name, module in saved.items():
+                sys.modules.pop(name, None) if module is None else sys.modules.__setitem__(name, module)
+        row = self.row()
+        self.assertEqual([p.name for p in uploads], ["video_7_editado.mp4"])
+        self.assertEqual(str(uploads[0]), row["edited_path"])
+        self.assertTrue(Path(row["raw_path"]).is_file())
+        self.assertLess(progress.index("approving"), progress.index("editing") if "editing" in progress else 99)
+        self.assertTrue(10 - 0.15 <= meta["duration"] <= 12 + 0.15)
+
+    def test_cli_dry_run_covers_the_whole_flow_with_zero_credit(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = self.sw.dry_run_edit(["--clip", str(self.clip), "--words", str(self.words_file),
+                                         "--workdir", str(self.work / "cli")])
+        data = json.loads(out.getvalue())
+        self.assertEqual((code, data["ok"], data["credits"], data["dry_run"]), (0, True, 0, True))
+        self.assertTrue(Path(data["raw_path"]).is_file() and Path(data["edited_path"]).is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
