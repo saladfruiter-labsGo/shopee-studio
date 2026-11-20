@@ -10,36 +10,92 @@ import subprocess
 import time
 from pathlib import Path
 
-from flow_steps import StepError, check_cost, domain_ok, label_allowed
+from flow_steps import StepError, check_cost, domain_ok, find_option, resolve_step
 
 CHROME = Path.home() / ".cache" / "ms-playwright" / "chromium-1234" / "chrome-linux64" / "chrome"
-PROMPT_BOX = 'div[role="textbox"][contenteditable="true"]'
-PROMPT_BOX_VISIBLE = PROMPT_BOX + ":visible"
 COST = re.compile(r"(\d+)\s*cr[eé]ditos?", re.I)
 NO_CREDITS = re.compile(r"cr[eé]ditos? insuficientes|n[aã]o (tem|há) cr[eé]ditos|sem cr[eé]ditos|limite de cr[eé]ditos", re.I)
 FAILED = re.compile(r"n[aã]o (foi|consegui) (poss[ií]vel )?gerar|falh(a|ou) na gera|viola|pol[ií]tica|n[aã]o posso gerar", re.I)
 FAILED_CARD = re.compile(r"^\s*warning|falha|algo deu errado|tente de novo", re.I)
 CHALLENGE = re.compile(r"n[aã]o sou um rob[oô]|unusual traffic|tr[aá]fego incomum|captcha|verify it'?s you|confirme que [eé] voc[eê]", re.I)
 COST_PANEL = re.compile(r"usar\s+(\d+)\s*cr[eé]ditos", re.I)
-# O Flow renomeia rótulos do seletor de mídia ("Enviar mídia" virou "Fazer upload de mídia" em 12/11/2026):
-# procure por padrão, no texto OU no aria-label, e nunca pela string exata de uma versão.
-UPLOAD_BUTTON = re.compile(r"enviar m[íi]dia|fazer upload|upload de m[íi]dia", re.I)
-INCLUDE_BUTTON = re.compile(r"incluir no comando", re.I)
+# C1 (issue #14): nenhum seletor fixo (classe, tag de componente, aria-label). A tela é lida num SNAPSHOT de
+# elementos (papel + texto + aria) e cada passo é resolvido por `flow_steps.resolve_step`: se o Flow renomear um
+# rótulo ou trocar um componente, o passo continua achando o alvo pelo que ele DIZ, ou falha com `ui_changed`.
+SNAPSHOT = r"""(root) => {
+    const scope = root >= 0 ? document.querySelectorAll('[data-ss-tile]')[root] : document;
+    if (!scope) return [];
+    document.querySelectorAll('[data-ss]').forEach(e => e.removeAttribute('data-ss'));
+    const roleOf = e => {
+        const r = (e.getAttribute('role') || '').toLowerCase();
+        if (r) return r;
+        return e.tagName === 'BUTTON' ? 'button' : (e.isContentEditable ? 'textbox' : '');
+    };
+    const out = [];
+    for (const e of scope.querySelectorAll('button, [role=button], [role=radio], [role=menuitem], [role=textbox], [contenteditable=true]')) {
+        const role = roleOf(e);
+        if (!role) continue;
+        e.setAttribute('data-ss', String(out.length));
+        out.push({i: out.length, role, text: (e.innerText || '').replace(/\s+/g, ' ').trim(),
+                  aria: e.getAttribute('aria-label') || '', visible: e.offsetParent !== null || e.getClientRects().length > 0,
+                  pressed: e.getAttribute('aria-pressed'), checked: e.getAttribute('aria-checked'),
+                  disabled: e.disabled === true || e.getAttribute('aria-disabled') === 'true'});
+    }
+    return out;
+}"""
 
-# Galeria do projeto em ordem do DOM (mais recente primeiro). Cada `flow-tile-container` é uma mídia:
-# imagem enviada (`flow-image-tile`, com o nome do arquivo), vídeo pronto (`flow-video-tile` com
-# `img.thumbnail`), geração em andamento (`flow-pending-tile`, com o texto do comando) ou geração que
-# falhou (`flow-error-tile`, "Falha / Não foi possível gerar o vídeo."). O tile de falha some ao recarregar.
-GALLERY = """() => [...document.querySelectorAll('flow-tile-container')].map(t => {
-    const text = (t.innerText || '').replace(/\\s+/g, ' ').trim();
-    const error = t.querySelector('flow-error-tile');
-    if (error) return {kind: 'error', text: ((error.querySelector('.error-subtitle') || error).innerText || '')
-        .replace(/\\s+/g, ' ').trim() || text};
-    if (t.querySelector('flow-pending-tile')) return {kind: 'pending', text};
-    if (t.querySelector('flow-video-tile')) return {kind: 'video', text,
-        thumb: (t.querySelector('flow-video-tile img.thumbnail') || t.querySelector('flow-video-tile img') || {}).src || ''};
-    return {kind: t.querySelector('flow-image-tile') ? 'image' : 'other', text};
-})"""
+# Galeria em ordem do DOM (mais recente primeiro). Um "tile" é o bloco mais externo cujo nome de elemento contém
+# "tile"; o tipo vem do que ele contém (nome com error/pending/video/image), sem lista fixa de componentes:
+# imagem enviada (com o nome do arquivo), vídeo pronto (miniatura), geração em andamento ou falha.
+GALLERY = r"""() => {
+    document.querySelectorAll('[data-ss-tile]').forEach(e => e.removeAttribute('data-ss-tile'));
+    const isTile = e => /tile/i.test(e.tagName) && e.tagName.includes('-');
+    const inTile = e => { for (let p = e.parentElement; p; p = p.parentElement) if (isTile(p)) return true; return false; };
+    const tiles = [...document.querySelectorAll('*')].filter(e => isTile(e) && !inTile(e));
+    return tiles.map((t, n) => {
+        t.setAttribute('data-ss-tile', String(n));
+        const text = (t.innerText || '').replace(/\s+/g, ' ').trim();
+        const inner = [t, ...t.querySelectorAll('*')].filter(isTile).map(e => e.tagName.toLowerCase());
+        const has = re => inner.some(name => re.test(name));
+        if (has(/error/)) return {kind: 'error', text};
+        if (has(/pending/)) return {kind: 'pending', text};
+        if (has(/video/)) { const img = t.querySelector('img');
+            return {kind: 'video', text, thumb: img ? img.src : ''}; }
+        return {kind: has(/image/) ? 'image' : 'other', text};
+    });
+}"""
+
+# Texto do painel de configurações: o menor ancestral que contém todas as opções (radios) visíveis do compositor,
+# menos os cartões de aprovação. Sem lista de rótulos (360p, 15s...): vale o papel dos elementos.
+SETTINGS_TEXT = r"""() => {
+    const opts = [...document.querySelectorAll('[role=radio]')].filter(b => b.offsetParent !== null
+        && !/^(aprovar|rejeitar)$/i.test(b.getAttribute('aria-label') || (b.innerText || '').trim()));
+    if (!opts.length) return null;
+    let node = opts[0].parentElement;
+    while (node && !opts.every(o => node.contains(o))) node = node.parentElement;
+    return node ? node.innerText : null;
+}"""
+
+# Cartões de confirmação em aberto: para cada opção "Aprovar" ainda livre, o texto do menor ancestral que fala de créditos.
+CARDS = r"""() => [...document.querySelectorAll('[role=radio]')]
+    .filter(r => /^aprovar$/i.test(r.getAttribute('aria-label') || r.innerText.trim())
+        && r.getAttribute('aria-disabled') !== 'true' && r.getAttribute('aria-checked') !== 'true')
+    .map(r => { let n = r.parentElement; while (n && !/cr.ditos?/i.test(n.innerText || '')) n = n.parentElement;
+                return n ? n.innerText : ''; })"""
+
+# Texto recente do chat do agente: elementos cujo nome contém "bubble".
+BUBBLES = r"""() => [...document.querySelectorAll('*')].filter(e => e.tagName.includes('-') && /bubble/i.test(e.tagName))
+    .map(e => e.innerText || '')"""
+
+# Quantas imagens há no compositor: ancestral comum da caixa de texto e do botão de envio.
+ATTACHED = r"""() => {
+    const box = [...document.querySelectorAll('[contenteditable=true], [role=textbox]')].find(b => b.offsetParent !== null);
+    if (!box) return 0;
+    let node = box.parentElement;
+    while (node && node.parentElement && !node.querySelector('button')) node = node.parentElement;
+    for (let i = 0; i < 3 && node && node.parentElement; i++) node = node.parentElement;
+    return node ? node.querySelectorAll('img').length : 0;
+}"""
 
 
 def scan_gallery(tiles, image_name, seen):
@@ -136,21 +192,34 @@ class Flow:
     def text(self):
         return self.page.evaluate("document.body ? document.body.innerText : ''")
 
-    def click_label(self, label, last=True, timeout=10):
-        """Click a button by aria-label through the DOM (hover-only controls report as not visible)."""
-        if not label_allowed(label):  # Lista fechada de botões: "Sempre aprovar" e qualquer outro não listado nunca são clicados.
-            raise FlowError("ui_changed", f"Clique recusado: '{label}' não está na lista de botões permitidos.")
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            done = self.page.evaluate("""([label, last]) => {
-                const all = [...document.querySelectorAll('button')].filter(b => b.getAttribute('aria-label') === label && !b.hidden);
-                const visible = all.filter(b => b.offsetParent !== null);
-                const target = (visible.length ? visible : all)[last ? (visible.length ? visible : all).length - 1 : 0];
-                if (!target) return false; target.click(); return true; }""", [label, last])
-            if done:
-                return
+    # ---------- leitura da tela (C1) ----------
+    def screen(self, tile=-1):
+        """Snapshot dos controles da tela (papel, texto, aria, estado). `tile` limita a um tile da galeria."""
+        return self.page.evaluate(SNAPSHOT, tile)
+
+    def locate(self, element):
+        return self.page.locator(f'[data-ss="{element["i"]}"]').first
+
+    def step(self, step_id, timeout=10, tile=-1):
+        """Resolve o passo contra a tela atual (re-lendo até `timeout`) e devolve o elemento. Nunca clica."""
+        deadline, error = time.time() + timeout, None
+        while True:
+            try:
+                return resolve_step(step_id, self.screen(tile))
+            except StepError as caught:
+                error = caught
+            if time.time() >= deadline:
+                raise FlowError(error.code, str(error)) from None
             time.sleep(0.5)
-        raise FlowError("ui_changed", f"Botão '{label}' não encontrado no Flow.")
+
+    def click_step(self, step_id, timeout=10, tile=-1):
+        """Clica no alvo que o passo resolveu. Os botões de decisão passam pela lista fechada (`gated`)."""
+        element = self.step(step_id, timeout, tile)
+        try:
+            self.locate(element).click(timeout=5000)
+        except Exception:  # Controles que só aparecem no hover: clique pelo DOM.
+            self.page.evaluate("(i) => { const e = document.querySelector(`[data-ss='${i}']`); if (e) e.click(); }", element["i"])
+        return element
 
     def check_session(self):
         url = self.page.url
@@ -168,55 +237,41 @@ class Flow:
         deadline = time.time() + 90
         while time.time() < deadline:
             self.check_session()
-            if self.page.locator(PROMPT_BOX_VISIBLE).count():
+            if self.has_prompt_box():
                 return
             if self.page.locator('a[href*="accounts.google.com/ServiceLogin"], a[href*="signin"]').count():
                 raise FlowError("login_required", "Flow aberto sem login: faça login no navegador da VM.")
             time.sleep(1)
         raise FlowError("ui_changed", "Caixa de comando do Flow não apareceu.")
 
-    def open_settings(self):
-        """Abre o painel do compositor (UI nova: 'Gatilho de configurações'), se ainda não estiver aberto."""
-        opened = self.page.evaluate("""() => {
-            const panes = [...document.querySelectorAll('.cdk-overlay-container .cdk-overlay-pane')];
-            if (panes.some(p => p.offsetParent !== null && [...p.querySelectorAll('button[role=radio]')]
-                    .some(b => /^(360p|720p|4s|6s|8s|10s|15s)$/.test(b.innerText.trim())))) return 'aberto';
-            const button = [...document.querySelectorAll('button')]
-                .find(b => b.getAttribute('aria-label') === 'Gatilho de configurações'
-                        && b.closest('flow-base-prompt-box'));
-            if (!button) return 'ausente';
-            button.click(); return 'clique'; }""")
-        if opened == "ausente":
-            raise FlowError("ui_changed", "Botão de configurações da caixa de comando não encontrado.")
-        self.settings_pane()
+    def has_prompt_box(self):
+        return any(e["role"] == "textbox" and e["visible"] for e in self.screen())
 
-    def settings_pane(self, timeout=20):
-        """Painel do compositor que mostra resolução/duração e o custo da geração."""
-        deadline = time.time() + timeout
+    def settings_text(self):
+        return self.page.evaluate(SETTINGS_TEXT)
+
+    def open_settings(self):
+        """Abre o painel do compositor (botão de configurações, achado pelo texto), se ainda não estiver aberto."""
+        if self.settings_text() is None:
+            self.click_step("open_settings")
+        deadline = time.time() + 20
         while time.time() < deadline:
-            handle = self.page.evaluate_handle("""() => {
-                const panes = [...document.querySelectorAll('.cdk-overlay-container .cdk-overlay-pane')]
-                    .filter(p => p.offsetParent !== null);
-                return panes.find(p => [...p.querySelectorAll('button[role=radio]')]
-                    .some(b => /^(360p|720p|4s|6s|8s|10s|15s)$/.test(b.innerText.trim()))) || null; }""")
-            pane = handle.as_element()
-            if pane:
-                return pane
+            if self.settings_text() is not None:
+                return
             time.sleep(0.5)
         raise FlowError("ui_changed", "Painel de configurações da caixa de comando não abriu.")
 
-    def pick(self, pane, label):
-        """Marca uma opção do painel. Clica no button[role=radio] de verdade: o clique via JS é ignorado."""
-        handle = pane.evaluate_handle("""(pane, label) => [...pane.querySelectorAll('button[role=radio]')]
-            .find(b => b.innerText.trim().endsWith(label)) || null""", label)
-        button = handle.as_element()
-        if not button:
-            raise FlowError("ui_changed", f"Opção '{label}' não encontrada nas configurações do Flow.")
-        if button.get_attribute("aria-checked") == "true":
+    def pick(self, label):
+        """Marca uma opção do painel (radio achado pelo texto). Clica de verdade: o clique via JS é ignorado."""
+        try:
+            option = find_option(label, self.screen())
+        except StepError as error:
+            raise FlowError(error.code, str(error)) from None
+        if option["checked"] == "true":
             return
-        button.click()
+        self.locate(option).click()
         time.sleep(0.5)
-        if button.get_attribute("aria-checked") != "true":
+        if find_option(label, self.screen())["checked"] != "true":
             raise FlowError("ui_changed", f"O Flow não marcou a opção '{label}'.")
 
     def agent_off(self):
@@ -226,25 +281,10 @@ class Flow:
         então o worker confere o estado do botão em toda tarefa e desliga se estiver ligado.
         """
         for _ in range(4):
-            state = self.page.evaluate("""() => {
-                const chip = document.querySelector('flow-agent-mode-toggle-chip button');
-                const box = document.querySelector('flow-base-prompt-box');
-                const botao = chip || (box ? [...box.querySelectorAll('button')]
-                    .find(b => (b.getAttribute('aria-label') || b.innerText.trim()) === 'Agente') : null);
-                if (!botao) return 'ausente';
-                return botao.getAttribute('aria-pressed') === 'true' ? 'ligado' : 'desligado';
-            }""")
-            if state == "ausente":
-                raise FlowError("ui_changed", "Botão do modo Agente não encontrado no compositor do Flow.")
-            if state == "desligado":
+            button = self.step("agent_off", timeout=5)
+            if button["pressed"] != "true":
                 return
-            self.page.evaluate("""() => {
-                const chip = document.querySelector('flow-agent-mode-toggle-chip button');
-                const box = document.querySelector('flow-base-prompt-box');
-                const botao = chip || (box ? [...box.querySelectorAll('button')]
-                    .find(b => (b.getAttribute('aria-label') || b.innerText.trim()) === 'Agente') : null);
-                if (botao) botao.click();
-            }""")
+            self.click_step("agent_off")
             time.sleep(3)
         raise FlowError("ui_changed", "Não consegui desligar o modo Agente do Flow; sem isso não há chave de vídeo.")
 
@@ -256,25 +296,19 @@ class Flow:
         """
         self.agent_off()  # Sem isso o compositor não oferece a chave Imagem/Vídeo.
         self.open_settings()
-        pane = self.settings_pane()
-        if not pane.evaluate("""(pane) => [...pane.querySelectorAll('button[role=radio]')]
-                .some(b => b.innerText.trim().endsWith('Vídeo'))"""):
+        try:
+            resolve_step("pick_video", self.screen())
+        except StepError:
             raise FlowError("ui_changed", "O painel do compositor não oferece a opção Vídeo "
-                                          "(modo Agente ainda ativo?).")
+                                          "(modo Agente ainda ativo?).") from None
         # Elementos: as imagens anexadas são referências do produto (em Frames, 2 imagens viram quadro inicial/final).
         for label in ("Vídeo", "Elementos", "9:16", "720p", duration, "x1"):
-            self.pick(pane, label)
-        state = pane.evaluate("""(pane) => ({
-            modelo: (pane.querySelector('button[aria-label="Selecionar família de modelos"]')?.innerText || '')
-                .replace('arrow_drop_down', '').trim(),
-            video: (() => { const b = [...pane.querySelectorAll('button[role=radio]')]
-                .find(b => b.innerText.trim().endsWith('Vídeo')); return b ? b.getAttribute('aria-checked') : null; })(),
-            text: pane.innerText})""")
-        if state.get("video") != "true":
-            raise FlowError("ui_changed", "O Flow não marcou a opção Vídeo no painel do compositor.")
-        if model.casefold() not in state["modelo"].casefold():
-            raise FlowError("model_mismatch", f"Modelo de vídeo no compositor é '{state['modelo']}', esperado '{model}'.")
-        cost = COST_PANEL.search(state["text"])
+            self.pick(label)
+        picker = self.step("model_picker", timeout=5)
+        current = re.sub(r"arrow_drop_down", "", picker["text"] or picker["aria"]).strip()
+        if model.casefold() not in current.casefold():
+            raise FlowError("model_mismatch", f"Modelo de vídeo no compositor é '{current}', esperado '{model}'.")
+        cost = COST_PANEL.search(self.settings_text() or "")
         if not cost:
             raise FlowError("ui_changed", "O Flow não mostrou o custo da geração no compositor.")
         if expected_cost is not None:
@@ -289,65 +323,61 @@ class Flow:
     def new_session(self):
         """Abre uma sessão nova para o agente não herdar cartões/vídeos da tarefa anterior."""
         try:
-            self.click_label("Iniciar nova sessão", timeout=5)
+            self.click_step("new_session", timeout=5)
             time.sleep(2)
         except FlowError:
             self.log("Flow: botão de nova sessão ausente; seguindo na sessão atual.")
         for _ in range(4):
-            try:
-                self.page.wait_for_selector(PROMPT_BOX_VISIBLE, timeout=8000)
+            if self.has_prompt_box():
                 return
-            except Exception:
-                self.page.keyboard.press("Escape")  # Um painel aberto deixa a caixa oculta.
-                time.sleep(1)
+            self.page.keyboard.press("Escape")  # Um painel aberto deixa a caixa oculta.
+            time.sleep(2)
         raise FlowError("ui_changed", "Caixa de comando do Flow não ficou visível.")
 
     def attached(self):
-        return self.page.evaluate("document.querySelectorAll('flow-creative-agent-prompt-box img, flow-base-prompt-box img').length")
+        return self.page.evaluate(ATTACHED)
 
     def overlay_button(self, pattern, timeout=15):
-        """Primeiro botão VISÍVEL do overlay aberto cujo texto ou aria-label casa com `pattern` (regex)."""
+        """Primeiro botão visível da tela cujo texto ou aria-label casa com `pattern` (regex), lido do snapshot."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            handle = self.page.evaluate_handle("""(source) => {
-                const re = new RegExp(source, 'i');
-                return [...document.querySelectorAll('.cdk-overlay-container button')]
-                    .filter(b => b.offsetParent !== null)
-                    .find(b => re.test((b.innerText || '') + ' ' + (b.getAttribute('aria-label') || ''))) || null;
-            }""", pattern.pattern)
-            element = handle.as_element()
-            if element:
-                return element
+            for element in self.screen():
+                if element["role"] in ("button", "menuitem") and element["visible"] and \
+                        pattern.search((element["text"] or "") + " " + (element["aria"] or "")):
+                    return element
             time.sleep(0.5)
         return None
 
     def attach_image(self, image, expected=1):
         """Envia a imagem e a insere na caixa de comando; `expected` = quantas imagens a caixa deve ter depois."""
         name = Path(image).name
-        self.click_label("Adicionar elementos à caixa de comando", last=False)
-        upload = self.overlay_button(UPLOAD_BUTTON)
-        if upload is None:
+        self.click_step("add_media")
+        try:
+            upload = self.step("upload", timeout=15)
+        except FlowError:
             raise FlowError("ui_changed", "Botão de upload do seletor de mídia não encontrado "
-                                          "(o Flow mudou o rótulo; veja o DOM em .cdk-overlay-container).")
+                                          "(o Flow mudou o rótulo).") from None
         with self.page.expect_file_chooser(timeout=15000) as chooser:
-            upload.click()
+            self.locate(upload).click()
         chooser.value.set_files(str(image))
         item = self.overlay_button(re.compile(re.escape(name)), timeout=90)
         if item is None:
             raise FlowError("ui_changed", f"A imagem {name} não apareceu no seletor de mídia depois do upload.")
         for _ in range(60):  # The item exists while still uploading; wait until it is clickable.
-            if self.page.evaluate("""(name) => { const b = [...document.querySelectorAll('.cdk-overlay-container button')]
-                .find(b => b.innerText.includes(name)); return !!b && !b.disabled && !b.querySelector('mat-progress-spinner, [role=progressbar]'); }""", name):
+            found = self.overlay_button(re.compile(re.escape(name)), timeout=1)
+            if found and not found["disabled"]:
+                item = found
                 break
             time.sleep(1)
-        item.click()
+        self.locate(item).click()
         # Algumas versões inserem a imagem no clique do item; outras mostram a prévia e pedem "Incluir no comando".
         for _ in range(3):  # O botão é re-renderizado enquanto a imagem sobe e pode sair do DOM no clique.
-            include = self.overlay_button(INCLUDE_BUTTON, timeout=3)
-            if include is None:
+            try:
+                self.step("include", timeout=3)
+            except FlowError:
                 break
             try:
-                include.click(timeout=8000)
+                self.click_step("include", timeout=3)
                 break
             except Exception:
                 self.page.wait_for_timeout(1000)
@@ -366,9 +396,6 @@ class Flow:
         if count != len(images):
             raise FlowError("ui_changed", f"A caixa de comando ficou com {count} imagem(ns); o esperado era {len(images)}.")
 
-    def tiles(self):
-        return self.page.evaluate("document.querySelectorAll('flow-video-tile').length")
-
     def submit(self, prompt):
         """Envia o comando e confirma pelo estado do compositor.
 
@@ -378,27 +405,25 @@ class Flow:
         clique). Nunca reenvia sem antes não haver sinal algum. Não conte o texto "Gerando": é o
         título de vídeos antigos e varia conforme a galeria virtualizada renderiza.
         """
-        box = self.page.locator(PROMPT_BOX_VISIBLE).first
-        box.click()
+        self.click_step("prompt_box")
         self.page.keyboard.insert_text(prompt)
         time.sleep(2)
 
         def estado():
-            return self.page.evaluate("""() => {
-                const caixa = document.querySelector('flow-base-prompt-box');
-                const texto = [...document.querySelectorAll('div[role=textbox][contenteditable=true]')]
-                    .filter(b => b.offsetParent !== null).map(b => (b.innerText || '').trim()).join('');
-                const botao = caixa ? [...caixa.querySelectorAll('button')]
-                    .find(b => (b.getAttribute('aria-label') || '') === 'Iniciar geração') : null;
-                return {vazio: texto.length === 0,
-                        desativado: !!botao && (botao.disabled || botao.getAttribute('aria-disabled') === 'true'),
-                        pendentes: document.querySelectorAll('flow-pending-tile, flow-error-tile').length};
-            }""")
+            screen = self.screen()
+            box = [e for e in screen if e["role"] == "textbox" and e["visible"]]
+            try:
+                botao = resolve_step("submit", screen)
+            except StepError:
+                botao = None
+            return {"vazio": not "".join(e["text"] for e in box).strip(),
+                    "desativado": bool(botao and botao["disabled"]),
+                    "pendentes": sum(1 for t in self.page.evaluate(GALLERY) if t["kind"] in ("pending", "error"))}
 
         antes = estado()
         if antes["vazio"]:
             raise FlowError("ui_changed", "Não consegui escrever o comando na caixa de comando do Flow.")
-        self.click_label("Iniciar geração")
+        self.click_step("submit")
         for tentativa in range(2):
             for _ in range(15):
                 time.sleep(1)
@@ -406,17 +431,16 @@ class Flow:
                 if agora["vazio"] or agora["desativado"] or agora["pendentes"] > antes["pendentes"]:
                     return
             if tentativa == 0:  # Nenhum sinal de envio: o clique não pegou, Enter costuma resolver.
-                self.page.locator(PROMPT_BOX_VISIBLE).first.click()
+                self.click_step("prompt_box")
                 self.page.keyboard.press("End")
                 self.page.keyboard.press("Enter")
                 time.sleep(2)
         raise FlowError("ui_changed", "O Flow não confirmou o envio do comando (nenhum sinal de geração).")
 
     def counts(self):
-        """Estado usado para reconhecer o resultado novo: miniaturas da galeria e bolhas do chat."""
-        return {"tiles": len(self.tile_thumbs()),
-                "bubbles": self.page.evaluate("() => document.querySelectorAll('flow-chat-bubble').length"),
-                "cards": self.page.evaluate("() => document.querySelectorAll('flow-permission-message').length"),
+        """Estado usado para reconhecer o resultado novo: miniaturas da galeria e cartões de confirmação."""
+        return {"tiles": len(self.tile_thumbs()), "bubbles": 0,
+                "cards": sum(1 for e in self.screen() if e["role"] == "radio" and re.fullmatch(r"aprovar", e["aria"] or "", re.I)),
                 "thumbs": self.tile_thumbs()}
 
     def card_if_any(self, expected_cost, before=None, timeout=20):
@@ -429,12 +453,8 @@ class Flow:
         deadline = time.time() + timeout
         while time.time() < deadline:
             self.check_session()
-            text = self.page.evaluate("""(before) => {
-                const cards = [...document.querySelectorAll('flow-permission-message')].slice(before.cards || 0);
-                const open = cards.filter(c => c.querySelector('[role=radio][aria-label="Aprovar"][aria-disabled="false"]')
-                    && !c.querySelector('[role=radio][aria-checked="true"]'));
-                return open.length ? open.pop().innerText : '';
-            }""", before)
+            cards = self.page.evaluate(CARDS)
+            text = cards[-1] if cards and (before.get("cards") or 0) <= len(cards) else ""
             if text:
                 match = COST.search(text)
                 if not match:
@@ -447,27 +467,25 @@ class Flow:
         return None, ""
 
     def agent_text(self):
-        return self.page.evaluate("[...document.querySelectorAll('flow-chat-bubble')].slice(-3).map(b => b.innerText).join('\\n')")
+        return "\n".join(self.page.evaluate(BUBBLES)[-3:])
 
     def answer(self, approve):
         """Pick exactly "Aprovar" or "Rejeitar" (never "Sempre aprovar": it would disable the cost check)."""
-        label = "Aprovar" if approve else "Rejeitar"
-        if not label_allowed(label):
-            raise FlowError("ui_changed", f"Clique recusado: '{label}' não está na lista de botões permitidos.")
-        option = self.page.locator(f'flow-permission-message [role="radio"][aria-label="{label}"][aria-disabled="false"]').last
-        if not option.count():
-            raise FlowError("ui_changed", f"Opção {label} não encontrada no cartão de confirmação.")
-        option.click()
+        step_id = "approve" if approve else "reject"
+        option = self.step(step_id, timeout=5)  # `gated`: só a lista fechada de botões passa.
+        self.locate(option).click()
+        wanted = "aprovar" if approve else "rejeitar"
         for _ in range(20):
             time.sleep(0.5)
-            if not self.page.locator(f'flow-permission-message [role="radio"][aria-label="{label}"][aria-disabled="false"][aria-checked="false"]').count():
+            if not any(e["role"] == "radio" and e["checked"] != "true" and not e["disabled"]
+                       and (e["aria"] or "").casefold() == wanted for e in self.screen()):
                 return
-        raise FlowError("ui_changed", f"O Flow não registrou a opção {label}.", charged=approve)
+        raise FlowError("ui_changed", f"O Flow não registrou a opção {'Aprovar' if approve else 'Rejeitar'}.",
+                        charged=approve)
 
     def tile_thumbs(self):
         """Miniaturas da galeria (uma por vídeo pronto, em ordem do mais recente para o mais antigo)."""
-        return self.page.evaluate("""() => [...document.querySelectorAll('flow-video-tile img')]
-            .map(i => i.src || '').filter(Boolean)""")
+        return [t["thumb"] for t in self.page.evaluate(GALLERY) if t["kind"] == "video" and t.get("thumb")]
 
     def gallery(self, image_name):
         return scan_gallery(self.page.evaluate(GALLERY), image_name, self.seen_thumbs)
@@ -488,7 +506,7 @@ class Flow:
         last_reload = next_log = time.time()
         while time.time() < deadline:
             self.check_session()
-            last = self.page.evaluate("""() => ([...document.querySelectorAll('flow-chat-bubble')].pop()?.innerText || '')""")
+            last = (self.page.evaluate(BUBBLES) or [""])[-1]
             if FAILED_CARD.search(last):
                 raise FlowError("render_failed", "Flow informou falha na geração: " + last.strip()[-250:], charged=True)
             state = self.gallery(image_name)
@@ -510,7 +528,7 @@ class Flow:
             # Em andamento: recarrega só a cada 5 min (recarregar apaga um tile de falha ainda não lido).
             if now - last_reload >= (300 if state["pending"] else 90):
                 self.page.goto(self.project_url, wait_until="domcontentloaded", timeout=90000)
-                self.page.wait_for_selector(PROMPT_BOX_VISIBLE, timeout=60000)
+                self.step("prompt_box", timeout=60)
                 time.sleep(5)
                 last_reload = time.time()
                 continue
@@ -520,21 +538,16 @@ class Flow:
     def download(self, destination):
         """Baixa em 720p o tile detectado por `wait_render`. Sem ele, falha: nunca baixa 'o mais recente'."""
         fresh = list(self.new_thumbs or [])
-        index = self.page.evaluate("""(fresh) => [...document.querySelectorAll('flow-video-tile')]
-            .findIndex(t => [...t.querySelectorAll('img')].some(im => fresh.includes(im.src || '')))""", fresh)
+        tiles = self.page.evaluate(GALLERY)  # também marca cada tile para o snapshot por escopo
+        index = next((n for n, t in enumerate(tiles) if t["kind"] == "video" and t.get("thumb") in fresh), -1)
         if not fresh or index < 0:
             raise FlowError("download_failed", "O vídeo desta tarefa sumiu da galeria antes do download; "
                                                "confira o projeto no Flow.", charged=True)
-        self.page.evaluate("""(index) => { const tile = [...document.querySelectorAll('flow-video-tile')][index];
-            const more = tile && [...tile.querySelectorAll('button')].find(b => b.getAttribute('aria-label') === 'Mais opções');
-            if (more) more.click(); }""", index)
-        item = self.page.locator('.cdk-overlay-container [role="menuitem"]', has_text=re.compile("download", re.I)).first
-        item.wait_for(timeout=15000)
-        item.click()
-        size = self.page.locator('.cdk-overlay-container [role="menuitem"]', has_text=re.compile("720p|Tamanho original", re.I)).first
-        size.wait_for(timeout=15000)
+        self.click_step("tile_more", timeout=10, tile=index)
+        self.click_step("menu_download", timeout=15)
+        size = self.step("menu_size", timeout=15)
         with self.page.expect_download(timeout=180000) as pending:
-            size.click()
+            self.locate(size).click()
         pending.value.save_as(str(destination))
         return Path(destination)
 

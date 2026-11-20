@@ -52,18 +52,51 @@ class FlowStepsTest(unittest.TestCase):
         with self.assertRaises(steps.StepError):
             steps.resolve_step("submit", trap + [dict(role="button", text="Sempre aprovar iniciar geração", aria="")])
 
-    def test_c2_flow_click_label_refuses_before_touching_the_page(self):
+    def fake_flow(self, elements):
+        """Flow sem navegador: `screen` devolve a tela de fixture e `locate` registra o que seria clicado."""
+        clicked = []
+
+        class Target:
+            def __init__(self, element):
+                self.element = element
+
+            def click(self, **kwargs):
+                clicked.append(self.element)
+
         instance = flow.Flow("/tmp/none")
+        instance.screen = lambda tile=-1: [dict(e, i=n) for n, e in enumerate(elements)]
+        instance.locate = lambda element: Target(element)
+        return instance, clicked
+
+    def test_c1_flow_resolves_steps_from_the_screen_not_from_selectors(self):
+        for label in ("Enviar mídia", "Fazer upload de mídia"):
+            instance, clicked = self.fake_flow([dict(role="button", text=label, aria="", visible=True)])
+            instance.click_step("upload", timeout=0)
+            self.assertEqual(clicked[0]["text"], label)
+        instance, clicked = self.fake_flow([dict(role="button", text="Compartilhar", aria="", visible=True)])
         with self.assertRaises(flow.FlowError) as ctx:
-            instance.click_label("Sempre aprovar")  # page é None: se chegasse ao clique, daria AttributeError
-        self.assertEqual(ctx.exception.code, "ui_changed")
+            instance.click_step("upload", timeout=0)
+        self.assertEqual((ctx.exception.code, clicked), ("ui_changed", []))
+
+    def test_c1_flow_source_has_no_fixed_selectors_or_label_clicks(self):
+        source = (ROOT / "worker" / "flow.py").read_text()
+        code = "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+        for forbidden in ("flow-base-prompt-box", "flow-video-tile", "flow-permission-message", "flow-chat-bubble",
+                          "click_label", "cdk-overlay", "360p", "UPLOAD_BUTTON", "PROMPT_BOX"):
+            self.assertNotIn(forbidden, code)
+
+    def test_c2_flow_never_clicks_always_approve(self):
+        screen = [dict(role="radio", text="Sempre aprovar", aria="Sempre aprovar", visible=True)]
+        instance, clicked = self.fake_flow(screen)
         with self.assertRaises(flow.FlowError):
-            instance.answer.__func__  # existe
-            instance.page = None
-            flow.Flow.answer(instance, True) if False else (_ for _ in ()).throw(flow.FlowError("ui_changed", "x"))
+            instance.answer(True)
+        self.assertEqual(clicked, [])
+        instance, clicked = self.fake_flow(screen + [dict(role="radio", text="Aprovar", aria="Aprovar", visible=True,
+                                                           checked="false", disabled=False)])
+        self.assertEqual(instance.step("approve", timeout=0)["text"], "Aprovar")  # só o botão da lista fechada
 
     def test_c2_cost_comes_from_config_and_mismatch_sends_nothing(self):
-        self.assertEqual(steps.check_cost(60, DEFAULTS["video_cost"]), 60)  # padrão da config
+        self.assertEqual(steps.check_cost(60, DEFAULTS["video_clip_cost_expected"]), 60)  # padrão da config
         self.assertEqual(steps.check_cost(15, 15), 15)                      # sem 60 fixo: vale o configurado
         for read in (15, 59, 61, None):
             with self.assertRaises(steps.StepError) as ctx:
@@ -73,14 +106,12 @@ class FlowStepsTest(unittest.TestCase):
             steps.check_cost(60, None)
 
     def test_flow_ensure_settings_maps_cost_mismatch(self):
-        class Pane:
-            def evaluate(self, script, *a):
-                return {"modelo": "Omni", "video": "true", "text": "usar 15 créditos"} if "modelo" in script else True
-
-        instance = flow.Flow("/tmp/none")
+        screen = [dict(role="button", text="Selecionar família de modelos Omni", aria="Selecionar família de modelos",
+                       visible=True)]
+        instance, _ = self.fake_flow(screen + [dict(role="radio", text="Vídeo", aria="", visible=True, checked="true")])
         instance.agent_off = instance.open_settings = lambda: None
-        instance.settings_pane = lambda timeout=20: Pane()
-        instance.pick = lambda pane, label: None
+        instance.settings_text = lambda: "usar 15 créditos"
+        instance.pick = lambda label: None
         with self.assertRaises(flow.FlowError) as ctx:
             instance.ensure_settings("Omni", expected_cost=60)
         self.assertEqual(ctx.exception.code, "cost_mismatch")
@@ -92,11 +123,11 @@ class FlowStepsTest(unittest.TestCase):
             self.assertFalse(steps.domain_ok(url))
 
     def test_budget_zero_refuses_real_generation(self):
-        ok, why = steps.budget_allows(dict(video_daily_credits=0, video_cost=60))
+        ok, why = steps.budget_allows(dict(video_daily_credits=0, video_clip_cost_expected=60))
         self.assertFalse(ok)
         self.assertIn("video_daily_credits = 0", why)
-        self.assertFalse(steps.budget_allows(dict(video_daily_credits=100, video_cost=60), used_today=60)[0])
-        self.assertTrue(steps.budget_allows(dict(video_daily_credits=120, video_cost=60), used_today=60)[0])
+        self.assertFalse(steps.budget_allows(dict(video_daily_credits=100, video_clip_cost_expected=60), used_today=60)[0])
+        self.assertTrue(steps.budget_allows(dict(video_daily_credits=120, video_clip_cost_expected=60), used_today=60)[0])
 
     def test_c3_download_is_the_current_generation_case_of_10_11(self):
         """10/11: o Flow re-renderizou vídeos antigos (outros produtos); só vale o que está ACIMA da imagem desta tarefa."""
@@ -515,6 +546,39 @@ class WorkerFlowTest(unittest.TestCase):
         data = json.loads(out.getvalue())
         self.assertEqual((code, data["ok"], data["credits"], data["dry_run"]), (0, True, 0, True))
         self.assertTrue(Path(data["raw_path"]).is_file() and Path(data["edited_path"]).is_file())
+
+
+class ConfigV3Test(unittest.TestCase):
+    def test_c2_migration_writes_cost_60_and_cap_0_even_with_15_75_saved(self):
+        """C2: banco antigo com custo 15 / teto 75 volta para 60 / 0; a migração roda uma vez só."""
+        from core import Store
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(directory)
+            with store.db() as db:
+                body = json.loads(db.execute("SELECT body FROM settings WHERE id=1").fetchone()[0])
+                body.pop("video_clip_cost_expected", None)
+                body.update(video_cost=15, video_daily_credits=75)
+                db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(body),))
+                db.execute("DELETE FROM flags WHERE key='v3_budget_migrated'")
+            store = Store(directory)
+            settings = store.settings()
+            self.assertEqual((settings["video_clip_cost_expected"], settings["video_daily_credits"]), (60, 0))
+            store.save_settings(dict(video_daily_credits=75))      # o igaoeu define o teto depois...
+            store = Store(directory)
+            self.assertEqual(store.settings()["video_daily_credits"], 75)  # ...e a migração não volta a rodar
+
+    def test_c2_old_key_is_a_documented_alias_of_the_new_one(self):
+        from core import DEFAULTS, validate_settings
+        self.assertNotIn("video_cost", DEFAULTS)
+        self.assertEqual(validate_settings(dict(video_cost=42))["video_clip_cost_expected"], 42)
+        self.assertEqual(validate_settings(dict(video_clip_cost_expected=42))["video_clip_cost_expected"], 42)
+
+    def test_c2_v3_path_uses_budget_allows_for_every_origin(self):
+        from v3 import budget_allows
+        settings = dict(video_daily_credits=0, video_clip_cost_expected=60)
+        self.assertFalse(budget_allows(settings)[0])
+        self.assertTrue(budget_allows(dict(settings, video_daily_credits=120), 60)[0])
+        self.assertFalse(budget_allows(dict(settings, video_daily_credits=100), 60)[0])
 
 
 if __name__ == "__main__":

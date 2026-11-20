@@ -204,12 +204,18 @@ class StudioVideoTest(unittest.TestCase):
         self.assertEqual(self.post(f"/studio/{sid}/videos/{video['id']}/send").status_code, 400)  # never twice
         self.assertIn("já foi enviado", self.generate(sid).json["error"])
 
-    def test_manual_videos_stay_out_of_the_daily_cap(self):
+    def test_manual_videos_count_in_the_daily_cap_and_cap_zero_blocks_them(self):
+        """C2 (issue #14): sem exceção para origem "manual"; teto 0 não gera nem manual."""
         self.connect_worker()
-        self.store.save_settings(dict(video_daily_credits=15))
+        self.store.save_settings(dict(video_daily_credits=0))
         sid = self.draft()
-        self.assertEqual(self.generate(sid).status_code, 202)
+        refused = self.generate(sid)
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn("video_daily_credits = 0", refused.json["error"])
         self.assertEqual(self.engine.videos.used_today(), 0)
+        self.store.save_settings(dict(video_daily_credits=15))
+        self.assertEqual(self.generate(sid).status_code, 202)
+        self.assertEqual(self.engine.videos.used_today(), 15)  # o manual entra na conta do teto
         self.assertEqual(self.engine.videos.manual_credits()["today"], 15)
         self.assertEqual(self.client.get("/api/studio").json["manual_credits"]["month"], 15)
         self.assertEqual(self.client.get("/api/studio").json["manual"][0]["video"]["state"], "queued")

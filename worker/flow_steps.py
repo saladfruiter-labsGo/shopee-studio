@@ -10,15 +10,25 @@ from urllib.parse import urlparse
 FLOW_HOSTS = ("flow.google.com", "labs.google")
 
 # Cada passo: papel do alvo e padrões (qualquer um casa, no texto OU no aria-label). Ordem = ordem do fluxo.
+# `gated` = botão de decisão/envio: só é clicado se estiver na lista fechada ALLOWED_BUTTONS.
+# `last` = vários candidatos (cartões, tiles): vale o último visível.
 FLOW_STEPS = [
     dict(id="open_project", role="page", match=[r"flow"]),
-    dict(id="agent_off", role="button", match=[r"^agente$"], expect_pressed=False),
-    dict(id="open_settings", role="button", match=[r"gatilho de configura[cç][oõ]es", r"configura[cç][oõ]es"]),
+    dict(id="agent_off", role="button", match=[r"^agente$"], expect_pressed=False, gated=True),
+    dict(id="open_settings", role="button", match=[r"gatilho de configura[cç][oõ]es", r"configura[cç][oõ]es"], gated=True),
     dict(id="pick_video", role="radio", match=[r"v[ií]deo$"]),
-    dict(id="add_media", role="button", match=[r"adicionar elementos", r"adicionar m[ií]dia"]),
+    dict(id="model_picker", role="button", match=[r"fam[ií]lia de modelos", r"selecionar modelo"]),
+    dict(id="new_session", role="button", match=[r"iniciar nova sess[aã]o", r"nova sess[aã]o"], gated=True),
+    dict(id="prompt_box", role="textbox", match=[r".*"], last=True),
+    dict(id="add_media", role="button", match=[r"adicionar elementos", r"adicionar m[ií]dia"], gated=True),
     dict(id="upload", role="button", match=[r"enviar m[íi]dia", r"fazer upload", r"upload de m[íi]dia"]),
     dict(id="include", role="button", match=[r"incluir no comando"]),
-    dict(id="submit", role="button", match=[r"iniciar gera[cç][aã]o"]),
+    dict(id="submit", role="button", match=[r"iniciar gera[cç][aã]o"], gated=True, last=True),
+    dict(id="approve", role="radio", match=[r"^aprovar$"], gated=True, last=True),
+    dict(id="reject", role="radio", match=[r"^rejeitar$"], gated=True, last=True),
+    dict(id="tile_more", role="button", match=[r"mais op[cç][oõ]es", r"more options"]),
+    dict(id="menu_download", role="menuitem", match=[r"download", r"baixar"], last=True),
+    dict(id="menu_size", role="menuitem", match=[r"720p", r"tamanho original"], last=True),
 ]
 STEPS = {step["id"]: step for step in FLOW_STEPS}
 
@@ -58,22 +68,42 @@ def domain_ok(url):
     return parsed.scheme == "https" and parsed.hostname in FLOW_HOSTS
 
 
-def resolve_step(step_id, elements):
-    """Acha na tela (lista de {role, text, aria}) o alvo do passo, por papel e texto — nunca por seletor.
-
-    Devolve o elemento ou levanta StepError('ui_changed'). Nunca devolve um botão proibido."""
-    step = STEPS[step_id]
+def _matches(step, element):
     patterns = [re.compile(p, re.I) for p in step["match"]]
-    for element in elements:
-        if step["role"] != "page" and element.get("role") != step["role"]:
-            continue
-        haystack = [_fold(element.get("text")), _fold(element.get("aria"))]
-        if any(FORBIDDEN_BUTTONS.search(h) for h in haystack):
-            continue
-        if any(p.search(h) for p in patterns for h in haystack if h):
-            return element
+    if step["role"] != "page" and element.get("role") != step["role"]:
+        return False
+    haystack = [_fold(element.get("text")), _fold(element.get("aria"))]
+    if any(FORBIDDEN_BUTTONS.search(h) for h in haystack):
+        return False
+    return any(p.search(h) for p in patterns for h in haystack if h) or step["match"] == [r".*"]
+
+
+def resolve_step(step_id, elements):
+    """Acha na tela (lista de {role, text, aria, visible?}) o alvo do passo, por papel e texto — nunca por seletor.
+
+    Prefere elementos visíveis; `last` pega o último candidato (cartões e tiles em ordem do DOM). Devolve o
+    elemento ou levanta StepError('ui_changed'). Nunca devolve um botão proibido."""
+    step = STEPS[step_id]
+    found = [e for e in elements if _matches(step, e)]
+    visible = [e for e in found if e.get("visible", True)]
+    found = visible or found
+    if found:
+        target = found[-1] if step.get("last") else found[0]
+        if step.get("gated"):
+            assert_clickable(target.get("aria") or target.get("text"))
+        return target
     raise StepError("ui_changed", f"Passo '{step_id}': nenhum elemento na tela casa com o papel "
                                   f"'{step['role']}' e os textos {step['match']}.")
+
+
+def find_option(label, elements):
+    """Opção de painel (radio) cujo texto termina em `label` ("Vídeo", "9:16", "720p"...). Por texto, sem seletor."""
+    want = _fold(label)
+    for element in elements:
+        if element.get("role") == "radio" and (_fold(element.get("text")).endswith(want)
+                                               or _fold(element.get("aria")) == want):
+            return element
+    raise StepError("ui_changed", f"Opção '{label}' não encontrada nas configurações do Flow.")
 
 
 def check_cost(read_cost, expected):
@@ -88,7 +118,7 @@ def check_cost(read_cost, expected):
 
 def budget_allows(settings, used_today=0):
     """Orçamento do dia: video_daily_credits = 0 recusa toda geração real (a edição e o dry_run custam 0)."""
-    cap, cost = int(settings.get("video_daily_credits", 0)), int(settings.get("video_cost", 0))
+    cap, cost = int(settings.get("video_daily_credits", 0)), int(settings.get("video_clip_cost_expected", 0))
     if cap <= 0:
         return False, "video_daily_credits = 0: geração real recusada até o igaoeu definir o teto."
     if used_today + cost > cap:

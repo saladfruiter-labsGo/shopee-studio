@@ -154,3 +154,16 @@ def fidelity_issues(note, ficha, script):
     if isinstance(score, bool) or not isinstance(score, int) or not 0 <= score <= 10:
         problems.append("score deve ser inteiro de 0 a 10")
     return problems
+
+
+# ---------- orçamento (C2) ----------
+def budget_allows(settings, used_today=0):
+    """Único portão de orçamento do caminho v3, para qualquer origem (automático, do dia ou manual).
+
+    Teto `video_daily_credits` = 0 recusa toda geração real; só o igaoeu muda o teto. Retorna (ok, motivo)."""
+    cap, cost = int(settings["video_daily_credits"]), int(settings["video_clip_cost_expected"])
+    if cap <= 0:
+        return False, "teto diário de 0 créditos (video_daily_credits = 0): geração real recusada até o igaoeu definir o teto"
+    if used_today + cost > cap:
+        return False, f"teto diário de {cap} créditos atingido ({used_today} usados hoje)"
+    return True, ""

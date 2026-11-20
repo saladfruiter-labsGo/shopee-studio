@@ -11,6 +11,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from v3 import budget_allows
+
 VIDEO_TASK_SECONDS = 6 * 3600     # A queued job may wait for the worker this long.
 MAX_VIDEO_BYTES = 50 * 1024 * 1024  # Telegram bot upload limit.
 PAUSE_CODES = {"login_required", "challenge", "cost_mismatch", "no_credits", "model_mismatch", "no_project"}
@@ -65,9 +67,9 @@ class Videos:
         return json.loads(row[0]) if row else None
 
     def used_today(self):
-        """Credits of the daily cap: automatic and 'Do dia' videos. Manual Studio videos stay out (E11)."""
+        """Credits of the daily cap: every origin counts, manual Studio videos included (C2, issue #14)."""
         with self.store.db() as db:
-            return db.execute("SELECT COALESCE(SUM(credits),0) FROM videos WHERE day=? AND COALESCE(origin,'')!='manual'",
+            return db.execute("SELECT COALESCE(SUM(credits),0) FROM videos WHERE day=?",
                               (today(self.tz),)).fetchone()[0]
 
     def manual_credits(self):
@@ -81,7 +83,7 @@ class Videos:
     def summary(self):
         settings = self.store.settings()
         return dict(enabled=settings["video_enabled"], used=self.used_today(), cap=settings["video_daily_credits"],
-                    cost=settings["video_cost"], paused=self.flag("video_pause"),
+                    cost=settings["video_clip_cost_expected"], paused=self.flag("video_pause"),
                     worker_online=self.store.worker_online("video"), labels=LABELS)
 
     def get(self, video_id):
@@ -134,15 +136,15 @@ class Videos:
                 reason = "URL do projeto do Flow não configurada"
             elif not product.get("image"):
                 reason = "anúncio sem imagem de referência"
-            elif self.used_today() + settings["video_cost"] > settings["video_daily_credits"]:
-                reason = f"teto diário de {settings['video_daily_credits']} créditos atingido"
+            elif not budget_allows(settings, self.used_today())[0]:
+                reason = budget_allows(settings, self.used_today())[1]
             now = datetime.now(self.tz).isoformat()
             with self.store.db() as db:
                 video_id = db.execute(
                     "INSERT INTO videos(run_id,product_key,day,state,credits,attempts,photo_message_id,error,created,updated,snapshot) "
                     "VALUES(?,?,?,?,?,0,?,?,?,?,?)",
                     (run_id, product["key"], today(self.tz), "skipped" if reason else "queued",
-                     0 if reason else settings["video_cost"], photo_message_id, reason, now, now,
+                     0 if reason else settings["video_clip_cost_expected"], photo_message_id, reason, now, now,
                      json.dumps(snapshot) if snapshot else None)).lastrowid
             if reason:
                 if manual:
@@ -152,13 +154,13 @@ class Videos:
                 return video_id
             self._task(video_id, product, analysis, settings)
             self.sync(video_id)
-            self.store.log("info", f"Vídeo de {product['name'][:50]} na fila do worker ({settings['video_cost']} créditos reservados).")
+            self.store.log("info", f"Vídeo de {product['name'][:50]} na fila do worker ({settings['video_clip_cost_expected']} créditos reservados).")
             return video_id
 
     def _task(self, video_id, product, analysis, settings):
         payload = dict(video_id=video_id, product=product["name"][:120], image_url=product["image"],
                        prompt=analysis.get("prompt") or "", narration=analysis.get("narration") or "",
-                       model=settings["video_model"], expected_cost=settings["video_cost"],
+                       model=settings["video_model"], expected_cost=settings["video_clip_cost_expected"],
                        project_url=settings["flow_project_url"])
         if product.get("mode") == "modern":
             # The product keeps the mode it was chosen with; older workers simply ignore this key.
@@ -191,7 +193,7 @@ class Videos:
         fallback (E10). 'Do dia' counts in the daily cap (E8); 'manual' stays out of it (E11). The finished video
         waits in "review" until the user approves the preview (E4)."""
         settings = self.store.settings()
-        cost = settings["video_cost"]
+        cost = settings["video_clip_cost_expected"]
         with self.lock:
             with self.store.db() as db:
                 latest = db.execute("SELECT state FROM videos WHERE studio_id=? ORDER BY id DESC LIMIT 1",
@@ -215,9 +217,9 @@ class Videos:
                 raise ValueError("Vídeos pausados: " + pause["reason"])
             if not settings["flow_project_url"]:
                 raise ValueError("URL do projeto do Flow não configurada nas Preferências.")
-            if origin != "manual" and self.used_today() + cost > settings["video_daily_credits"]:
-                raise ValueError(f"Teto diário de {settings['video_daily_credits']} créditos atingido "
-                                 f"({self.used_today()} usados hoje).")
+            allowed, why = budget_allows(settings, self.used_today())  # C2: sem exceção para origem "manual"
+            if not allowed:
+                raise ValueError(why[0].upper() + why[1:] + ".")
             now = datetime.now(self.tz).isoformat()
             with self.store.db() as db:
                 video_id = db.execute(
@@ -232,7 +234,7 @@ class Videos:
                 db.execute("UPDATE videos SET task_id=?,attempts=attempts+1 WHERE id=?", (task_id, video_id))
         self.sync(video_id)
         self.store.log("info", f"Estúdio #{studio_id}: vídeo de {name[:50]} na fila do worker "
-                               f"({cost} créditos{', fora do teto diário' if origin == 'manual' else ''}).")
+                               f"({cost} créditos, dentro do teto diário).")
         return video_id
 
     def discard(self, video_id):

@@ -32,7 +32,7 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 top_count=3, commission_weight=50, rating_weight=30, sales_weight=20,
                 schedule_time="12:00", schedule_enabled=True, auto_send=False,
                 max_pages=100, page_limit=20,
-                video_enabled=True, video_daily_credits=0, video_cost=60, video_model="Omni 1.1 Flash",
+                video_enabled=True, video_daily_credits=0, video_clip_cost_expected=60, video_model="Omni 1.1 Flash",
                 flow_project_url="",
                 # "legacy" = behaviour before the Modern mode; "modern" = PLANO_MODO_MODERNO.md.
                 mode="legacy",
@@ -45,7 +45,7 @@ DEFAULTS = dict(keyword="", min_rating=4.5, relax_rating=False,
                 # Estúdio (PLANO_ESTUDIO.md): the best N products of each send wait for the user; without any
                 # generation by the cutoff they fall back to the automatic video. 0 = off (behaviour unchanged).
                 studio_slots=0, studio_cutoff="22:00",
-                # Padrão v3 (issue #14). video_cost = video_clip_cost_expected da spec (créditos esperados por clipe);
+                # Padrão v3 (issue #14). video_clip_cost_expected = video_clip_cost_expected da spec (créditos esperados por clipe);
                 # video_daily_credits = 0 recusa toda geração real até o igaoeu definir o teto.
                 script_words_target=25, script_words_tol=3,
                 edit_min_s=10.0, edit_max_s=12.0, hook_end_s=6.0, shot_target_s=2.0, shot_tol_s=0.5,
@@ -90,6 +90,9 @@ def validate_settings(payload, existing=None):
     # Ignore category_id left by older versions.
     result = dict(DEFAULTS)
     result.update({key: value for key, value in (existing or {}).items() if key in DEFAULTS})
+    if isinstance(payload, dict) and "video_cost" in payload:
+        # Alias documentado: `video_cost` é o nome antigo de `video_clip_cost_expected` (README, "Configuração v3").
+        payload = {("video_clip_cost_expected" if key == "video_cost" else key): value for key, value in payload.items()}
     if not isinstance(payload, dict) or set(payload) - set(DEFAULTS):
         raise ValueError("Configuração desconhecida.")
     for key, value in payload.items():
@@ -154,7 +157,7 @@ def validate_settings(payload, existing=None):
     for key, low, high in (("repeat_days", 0, 365), ("top_count", 1, 10),
                            ("per_shop", 1, 10), ("studio_slots", 0, 10),
                            ("max_pages", 1, 500), ("page_limit", 1, 50),
-                           ("video_daily_credits", 0, 2000), ("video_cost", 1, 500),
+                           ("video_daily_credits", 0, 2000), ("video_clip_cost_expected", 1, 500),
                            ("script_words_target", 5, 80), ("script_words_tol", 0, 20)):
         if not low <= result[key] <= high:
             raise ValueError(f"{key}: use {low} a {high}.")
@@ -243,6 +246,12 @@ class Store:
             db.execute("INSERT OR IGNORE INTO settings VALUES(1,?)", (json.dumps(first),))
             stored_settings = json.loads(db.execute("SELECT body FROM settings WHERE id=1").fetchone()[0])
             migrated_settings = validate_settings({}, stored_settings)
+            if not db.execute("SELECT 1 FROM flags WHERE key='v3_budget_migrated'").fetchone():
+                # Migração do padrão v3 (uma vez): custo esperado 60 e teto diário 0, mesmo que o banco guarde 15/75.
+                # Depois disso o igaoeu define o teto pelas Preferências e a migração não toca mais nos valores.
+                migrated_settings["video_clip_cost_expected"] = DEFAULTS["video_clip_cost_expected"]
+                migrated_settings["video_daily_credits"] = DEFAULTS["video_daily_credits"]
+                db.execute("INSERT INTO flags VALUES('v3_budget_migrated','true')")
             if migrated_settings != stored_settings:
                 db.execute("UPDATE settings SET body=? WHERE id=1", (json.dumps(migrated_settings),))
             # A process crash during delivery is ambiguous; never automatically resend it.
