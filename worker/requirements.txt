@@ -1,7 +1,7 @@
 # Dependências do worker de vídeo (venv da hermes). As versões são as mesmas fixadas em install.sh.
 # NÃO instalar à mão: quem instala é worker/install.sh, depois do clique do igaoeu.
 # Sem faster-whisper não há transcrição por palavra e, pelo ED-8, a edição não roda e nada é enviado.
-playwright==1.62.0
+playwright==1.65.2
 faster-whisper==1.2.1
 ctranslate2==4.8.1
 av==18.1.0
